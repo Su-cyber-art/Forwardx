@@ -1,0 +1,959 @@
+import { Router, Request, Response } from "express";
+import * as db from "./db";
+import { AGENT_VERSION } from "./_core/systemRouter";
+import { isHostMetricsWatching } from "./agentEvents";
+import { compareVersions, parseSelfTestMeta, tunnelSecretSeed } from "./agentRouteUtils";
+import { resolvePanelUrl } from "./agentPanelUrl";
+
+export function registerAgentHeartbeatRoute(agentRouter: Router) {
+agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const token = authHeader.substring(7);
+    const host = await db.getHostByAgentToken(token);
+    if (!host) {
+      res.status(401).json({ error: "Invalid token" });
+      return;
+    }
+
+    const { cpuUsage, cpuInfo, memoryUsage, memoryUsed, networkIn, networkOut, diskUsage, diskUsed, diskTotal, uptime, agentVersion } = req.body;
+
+    await db.updateHostHeartbeat(host.id, {
+      agentVersion: agentVersion || (host as any).agentVersion || null,
+      cpuInfo: cpuInfo || (host as any).cpuInfo || null,
+    } as any);
+
+    await db.insertHostMetric({
+      hostId: host.id,
+      cpuUsage: cpuUsage ?? null,
+      memoryUsage: memoryUsage ?? null,
+      memoryUsed: memoryUsed ?? null,
+      networkIn: networkIn ?? null,
+      networkOut: networkOut ?? null,
+      diskUsage: diskUsage ?? null,
+      diskUsed: diskUsed ?? null,
+      diskTotal: diskTotal ?? null,
+      uptime: uptime ?? null,
+    });
+
+    // 获取该主机的转发规则
+    const rules = await db.getForwardRulesForAgent(host.id);
+    const hostTunnels = await db.getTunnelsByHost(host.id);
+    const actions: any[] = [];
+
+    // 获取主机配置的网卡名称（用于 realm --interface）
+    const hostInterface = (host as any).networkInterface || "";
+
+    /** 包装一条只追加一次的 iptables 规则：先 -C 检查是否存在，不存在才 -A */
+    const ipIfMissing = (rule: string) => `iptables -C ${rule} 2>/dev/null || iptables -A ${rule}`;
+    const ipIfMissingT = (table: string, rule: string) =>
+      `iptables -t ${table} -C ${rule} 2>/dev/null || iptables -t ${table} -A ${rule}`;
+
+    /**
+     * 为转发规则创建一对 mangle 计数链以跨转发方式采集准确流量。
+     * - FWX_IN_<port>：匹配 dport=<port> 的入站包（客户端→Agent）
+     * - FWX_OUT_<port>：匹配 sport=<port> 的出站包（Agent→客户端响应）
+     * 不设 RETURN，所以只作计数不影响路由。三种转发方式都会经过 mangle 表，覆盖 100% 路径。
+     */
+    const buildCountingChainCmds = (port: number): string[] => {
+      const inCh = `FWX_IN_${port}`;
+      const outCh = `FWX_OUT_${port}`;
+      return [
+        // 创建链（如已存在则忽略）
+        `iptables -t mangle -N ${inCh} 2>/dev/null || true`,
+        `iptables -t mangle -N ${outCh} 2>/dev/null || true`,
+        // 挂入（使用 -C 防重）
+        `iptables -t mangle -C PREROUTING -p tcp --dport ${port} -j ${inCh} 2>/dev/null || iptables -t mangle -A PREROUTING -p tcp --dport ${port} -j ${inCh}`,
+        `iptables -t mangle -C PREROUTING -p udp --dport ${port} -j ${inCh} 2>/dev/null || iptables -t mangle -A PREROUTING -p udp --dport ${port} -j ${inCh}`,
+        `iptables -t mangle -C POSTROUTING -p tcp --sport ${port} -j ${outCh} 2>/dev/null || iptables -t mangle -A POSTROUTING -p tcp --sport ${port} -j ${outCh}`,
+        `iptables -t mangle -C POSTROUTING -p udp --sport ${port} -j ${outCh} 2>/dev/null || iptables -t mangle -A POSTROUTING -p udp --sport ${port} -j ${outCh}`,
+        `iptables -t mangle -C INPUT -p tcp --dport ${port} -j ${inCh} 2>/dev/null || iptables -t mangle -A INPUT -p tcp --dport ${port} -j ${inCh}`,
+        `iptables -t mangle -C INPUT -p udp --dport ${port} -j ${inCh} 2>/dev/null || iptables -t mangle -A INPUT -p udp --dport ${port} -j ${inCh}`,
+        `iptables -t mangle -C OUTPUT -p tcp --sport ${port} -j ${outCh} 2>/dev/null || iptables -t mangle -A OUTPUT -p tcp --sport ${port} -j ${outCh}`,
+        `iptables -t mangle -C OUTPUT -p udp --sport ${port} -j ${outCh} 2>/dev/null || iptables -t mangle -A OUTPUT -p udp --sport ${port} -j ${outCh}`,
+      ];
+    };
+    const buildCountingCleanupCmds = (port: number): string[] => [
+      `iptables -t mangle -D PREROUTING -p tcp --dport ${port} -j FWX_IN_${port} 2>/dev/null || true`,
+      `iptables -t mangle -D PREROUTING -p udp --dport ${port} -j FWX_IN_${port} 2>/dev/null || true`,
+      `iptables -t mangle -D POSTROUTING -p tcp --sport ${port} -j FWX_OUT_${port} 2>/dev/null || true`,
+      `iptables -t mangle -D POSTROUTING -p udp --sport ${port} -j FWX_OUT_${port} 2>/dev/null || true`,
+      `iptables -t mangle -D INPUT -p tcp --dport ${port} -j FWX_IN_${port} 2>/dev/null || true`,
+      `iptables -t mangle -D INPUT -p udp --dport ${port} -j FWX_IN_${port} 2>/dev/null || true`,
+      `iptables -t mangle -D OUTPUT -p tcp --sport ${port} -j FWX_OUT_${port} 2>/dev/null || true`,
+      `iptables -t mangle -D OUTPUT -p udp --sport ${port} -j FWX_OUT_${port} 2>/dev/null || true`,
+      `iptables -t mangle -F FWX_IN_${port} 2>/dev/null || true`,
+      `iptables -t mangle -X FWX_IN_${port} 2>/dev/null || true`,
+      `iptables -t mangle -F FWX_OUT_${port} 2>/dev/null || true`,
+      `iptables -t mangle -X FWX_OUT_${port} 2>/dev/null || true`,
+      `iptables -D INPUT -p tcp --dport ${port} -j FWX_IN_${port} 2>/dev/null || true`,
+      `iptables -D INPUT -p udp --dport ${port} -j FWX_IN_${port} 2>/dev/null || true`,
+      `iptables -D OUTPUT -p tcp --sport ${port} -j FWX_OUT_${port} 2>/dev/null || true`,
+      `iptables -D OUTPUT -p udp --sport ${port} -j FWX_OUT_${port} 2>/dev/null || true`,
+      `iptables -F FWX_IN_${port} 2>/dev/null || true`,
+      `iptables -X FWX_IN_${port} 2>/dev/null || true`,
+      `iptables -F FWX_OUT_${port} 2>/dev/null || true`,
+      `iptables -X FWX_OUT_${port} 2>/dev/null || true`,
+    ];
+    const buildManagedPortCleanupCmds = (port: number): string[] => [
+      `systemctl stop forwardx-socat-${port}.service forwardx-socat-tcp-${port}.service forwardx-socat-udp-${port}.service forwardx-realm-${port}.service 2>/dev/null || true`,
+      `systemctl disable forwardx-socat-${port}.service forwardx-socat-tcp-${port}.service forwardx-socat-udp-${port}.service forwardx-realm-${port}.service 2>/dev/null || true`,
+      `rm -f /etc/systemd/system/forwardx-socat-${port}.service /etc/systemd/system/forwardx-socat-tcp-${port}.service /etc/systemd/system/forwardx-socat-udp-${port}.service /etc/systemd/system/forwardx-realm-${port}.service`,
+      `systemctl daemon-reload`,
+      `rm -f /var/lib/forwardx-agent/traffic_${port}.prev /var/lib/forwardx-agent/port_${port}.rule /var/lib/forwardx-agent/port_${port}.fwtype /var/lib/forwardx-agent/target_${port}.info 2>/dev/null || true`,
+      ...buildCountingCleanupCmds(port),
+    ];
+    const writeUnitCmd = (svcName: string, unit: string) =>
+      `printf '%s' '${Buffer.from(unit, "utf8").toString("base64")}' | base64 -d > /etc/systemd/system/${svcName}.service`;
+    const gostServiceName = "forwardx-gost";
+    const gostServiceUnit = [
+      "[Unit]",
+      "Description=ForwardX unified gost forwarder",
+      "After=network.target",
+      "",
+      "[Service]",
+      "Type=simple",
+      "ExecStart=/usr/local/bin/gost -C /etc/forwardx-gost/config.json",
+      "Restart=always",
+      "RestartSec=5",
+      "LimitNOFILE=65535",
+      "",
+      "[Install]",
+      "WantedBy=multi-user.target",
+      "",
+    ].join("\n");
+    const agentHostRules = await db.getForwardRulesForAgent(host.id);
+    const agentAllRules = await db.getForwardRulesForAgent(undefined);
+    const gostRules = agentHostRules
+      .filter((r: any) => !r.pendingDelete && r.isEnabled && r.forwardType === "gost");
+    const gostRuleUserIds = Array.from(new Set(agentHostRules.map((r: any) => Number(r.userId)).filter(Boolean)));
+    const gostUsers = await Promise.all(gostRuleUserIds.map((id) => db.getUserById(id)));
+    const gostUserById = new Map(gostUsers.filter(Boolean).map((u: any) => [u.id, u]));
+    const gostRateLimiters = gostUsers
+      .filter((u: any) => u && (Number(u.gostRateLimitIn) > 0 || Number(u.gostRateLimitOut) > 0))
+      .map((u: any) => ({
+        name: `fwx-user-${u.id}`,
+        limits: [`$ ${Math.max(0, Number(u.gostRateLimitIn) || 0)}B ${Math.max(0, Number(u.gostRateLimitOut) || 0)}B`],
+      }));
+    const applyGostLimiter = (service: any, userId: number) => {
+      const user = gostUserById.get(userId) as any;
+      if (user && (Number(user.gostRateLimitIn) > 0 || Number(user.gostRateLimitOut) > 0)) {
+        service.limiter = `fwx-user-${user.id}`;
+      }
+      return service;
+    };
+    const userRateLimits = (userId: number) => {
+      const user = gostUserById.get(userId) as any;
+      return {
+        limitIn: Math.max(0, Number(user?.gostRateLimitIn) || 0),
+        limitOut: Math.max(0, Number(user?.gostRateLimitOut) || 0),
+      };
+    };
+    const userAccessLimits = (userId: number) => {
+      const user = gostUserById.get(userId) as any;
+      return {
+        maxConnections: Math.max(0, Number(user?.maxConnections) || 0),
+        maxIPs: Math.max(0, Number(user?.maxIPs) || 0),
+      };
+    };
+    const accessScopeName = (scope: string) => `FWX_LIMIT_${scope.replace(/[^A-Za-z0-9_]/g, "_").slice(0, 40)}`;
+    const buildAccessLimitCleanupCmds = (port: number, scope: string): string[] => {
+      const chain = accessScopeName(scope);
+      return [
+        `iptables -D INPUT -p tcp --dport ${port} -j ${chain} 2>/dev/null || true`,
+        `iptables -D FORWARD -p tcp --dport ${port} -j ${chain} 2>/dev/null || true`,
+      ];
+    };
+    const buildAccessLimitCmds = (port: number, scope: string, limits: { maxConnections?: number; maxIPs?: number }): string[] => {
+      const maxConnections = Math.max(0, Number(limits.maxConnections || 0));
+      const maxIPs = Math.max(0, Number(limits.maxIPs || 0));
+      if (maxConnections <= 0 && maxIPs <= 0) return buildAccessLimitCleanupCmds(port, scope);
+      const chain = accessScopeName(scope);
+      const cmds = [
+        `iptables -N ${chain} 2>/dev/null || true`,
+        `iptables -F ${chain} 2>/dev/null || true`,
+      ];
+      if (maxConnections > 0) {
+        cmds.push(`iptables -A ${chain} -p tcp -m connlimit --connlimit-above ${maxConnections} --connlimit-mask 0 -j REJECT --reject-with tcp-reset`);
+      }
+      if (maxIPs > 0) {
+        cmds.push(`iptables -A ${chain} -p tcp -m connlimit --connlimit-above ${maxIPs} --connlimit-mask 32 -j REJECT --reject-with tcp-reset`);
+      }
+      cmds.push(`iptables -A ${chain} -j RETURN`);
+      cmds.push(`iptables -C INPUT -p tcp --dport ${port} -j ${chain} 2>/dev/null || iptables -I INPUT -p tcp --dport ${port} -j ${chain}`);
+      cmds.push(`iptables -C FORWARD -p tcp --dport ${port} -j ${chain} 2>/dev/null || iptables -I FORWARD -p tcp --dport ${port} -j ${chain}`);
+      return cmds;
+    };
+    const tunnelById = new Map((hostTunnels as any[]).map((t: any) => [t.id, t]));
+    const accessScopeForRule = (rule: any) => (
+      rule.tunnelId
+        ? `u${Number(rule.userId) || 0}_t${Number(rule.tunnelId) || 0}`
+        : `u${Number(rule.userId) || 0}_h${host.id}`
+    );
+    const tunnelProtocolType = (mode: string) => {
+      if (mode === "wss" || mode === "mwss") return "ws";
+      if (mode === "tcp" || mode === "mtcp") return "tcp";
+      return "tls";
+    };
+    const tunnelProtocolMetadata = (mode: string) => (
+      mode === "mtls" || mode === "mwss" || mode === "mtcp"
+        ? { mux: "true" }
+        : undefined
+    );
+    const isForwardXTunnel = (tunnel: any) => String(tunnel?.mode || "").toLowerCase() === "forwardx";
+    const tunnelForwardProtos = (protocol: string) => protocol === "udp" ? ["udp"] : (protocol === "both" ? ["tcp", "udp"] : ["tcp"]);
+    const tunnelExitHostAddress = async (tunnel: any) => {
+      const exit = await db.getHostById(tunnel.exitHostId);
+      if (!exit) return "";
+      return ((exit as any).entryIp && String((exit as any).entryIp).trim()) || exit.ip || "";
+    };
+    const tunnelExitHostById = new Map<number, string>();
+    for (const tunnel of hostTunnels as any[]) {
+      if (tunnel.entryHostId === host.id && tunnel.isEnabled) {
+        tunnelExitHostById.set(tunnel.id, await tunnelExitHostAddress(tunnel));
+      }
+    }
+    const tunnelProbes = (hostTunnels as any[])
+      .filter((tunnel: any) => tunnel.entryHostId === host.id && tunnel.isEnabled)
+      .map((tunnel: any) => ({
+        tunnelId: tunnel.id,
+        targetIp: tunnelExitHostById.get(tunnel.id) || "",
+        targetPort: Number(tunnel.listenPort) || 0,
+        protocol: "tcp",
+      }))
+      .filter((probe: any) => probe.targetIp && probe.targetPort > 0);
+    const tunnelExitRules = agentAllRules
+      .filter((r: any) => {
+        if (r.pendingDelete || !r.isEnabled || r.forwardType !== "gost" || !r.tunnelId) return false;
+        const tunnel = tunnelById.get(r.tunnelId) as any;
+        return !!tunnel && tunnel.isEnabled && tunnel.exitHostId === host.id;
+      });
+
+    const gostServiceConfig = gostRules
+      .flatMap((r: any) => {
+        const tunnel = (r as any).tunnelId ? tunnelById.get((r as any).tunnelId) as any : null;
+        if (tunnel && isForwardXTunnel(tunnel)) return [];
+        const protos = tunnel ? tunnelForwardProtos(r.protocol) : (r.protocol === "both" ? ["tcp", "udp"] : [r.protocol === "udp" ? "udp" : "tcp"]);
+        return protos.map((proto) => {
+          if ((r as any).gostMode === "reverse") {
+            return applyGostLimiter({
+              name: `fwx-${r.id}-${proto}`,
+              addr: ":0",
+              handler: { type: proto === "udp" ? "rudp" : "rtcp" },
+              listener: { type: proto === "udp" ? "rudp" : "rtcp", chain: `chain-${r.id}-${proto}` },
+              forwarder: {
+                nodes: [{
+                  name: `target-${r.id}`,
+                  addr: `${r.targetIp}:${r.targetPort}`,
+                }],
+              },
+            }, Number(r.userId));
+          }
+          const tunnelExitHost = tunnel ? tunnelExitHostById.get(tunnel.id) : "";
+          const service: any = {
+            name: `fwx-${r.id}-${proto}`,
+            addr: `:${r.sourcePort}`,
+            handler: tunnel ? { type: proto, chain: `chain-tunnel-${r.id}` } : { type: proto },
+            listener: { type: proto },
+          };
+          if (!tunnel) {
+            service.forwarder = {
+              nodes: [{
+                name: `target-${r.id}`,
+                addr: `${r.targetIp}:${r.targetPort}`,
+                connector: { type: proto },
+                dialer: { type: proto },
+              }],
+            };
+          } else if (!tunnelExitHost || !(r as any).tunnelExitPort) {
+            return null;
+          }
+          return applyGostLimiter(service, Number(r.userId));
+        });
+      })
+      .filter(Boolean);
+    const reverseGostChains = gostRules
+      .filter((r: any) => (r as any).gostMode === "reverse")
+      .flatMap((r: any) => {
+        const protos = r.protocol === "both" ? ["tcp", "udp"] : [r.protocol === "udp" ? "udp" : "tcp"];
+        return protos.map((proto) => {
+          const tunnelId = `00000000-0000-4000-8000-${String(r.id).padStart(12, "0").slice(-12)}`;
+          return {
+            name: `chain-${r.id}-${proto}`,
+            hops: [{
+              name: `hop-${r.id}-${proto}`,
+              nodes: [{
+                name: `relay-${r.id}-${proto}`,
+                addr: `${(r as any).gostRelayHost}:${(r as any).gostRelayPort}`,
+                connector: {
+                  type: "tunnel",
+                  metadata: { "tunnel.id": tunnelId },
+                },
+                dialer: { type: "tcp" },
+              }],
+            }],
+          };
+        });
+      });
+    const tunnelGostChains = gostRules
+      .filter((r: any) => r.isEnabled && r.forwardType === "gost" && r.tunnelId)
+      .flatMap((r: any) => {
+        const tunnel = tunnelById.get((r as any).tunnelId) as any;
+        if (isForwardXTunnel(tunnel)) return [];
+        const tunnelExitHost = tunnel ? tunnelExitHostById.get(tunnel.id) : "";
+        if (!tunnel || !tunnelExitHost || !(r as any).tunnelExitPort) return [];
+        return [{
+          name: `chain-tunnel-${r.id}`,
+          hops: [{
+            name: `hop-tunnel-${r.id}`,
+            nodes: [{
+              name: `exit-${r.id}`,
+              addr: `${tunnelExitHost}:${(r as any).tunnelExitPort}`,
+              connector: { type: "relay" },
+              dialer: {
+                type: tunnelProtocolType(tunnel.mode),
+                ...(tunnelProtocolMetadata(tunnel.mode) ? { metadata: tunnelProtocolMetadata(tunnel.mode) } : {}),
+              },
+            }],
+          }],
+        }];
+      });
+    const gostChains = [...reverseGostChains, ...tunnelGostChains];
+    const buildGostReloadCmds = () => {
+      const encodedConfig = Buffer.from(JSON.stringify({ services: gostServiceConfig, chains: gostChains, limiters: gostRateLimiters }, null, 2), "utf8").toString("base64");
+      return [
+        `command -v /usr/local/bin/gost >/dev/null 2>&1 || command -v gost >/dev/null 2>&1`,
+        `mkdir -p /etc/forwardx-gost`,
+        `printf '%s' '${encodedConfig}' | base64 -d > /etc/forwardx-gost/config.json`,
+        writeUnitCmd(gostServiceName, gostServiceUnit),
+        `systemctl daemon-reload`,
+        `systemctl enable ${gostServiceName}.service 2>/dev/null || true`,
+        gostServiceConfig.length > 0
+          ? `systemctl restart ${gostServiceName}.service`
+          : `systemctl stop ${gostServiceName}.service 2>/dev/null || true`,
+      ];
+    };
+    const buildTunnelReloadCmds = () => {
+      const tunnelProbeServices = hostTunnels
+        .filter((tunnel: any) => tunnel.exitHostId === host.id && tunnel.isEnabled && !isForwardXTunnel(tunnel))
+        .map((tunnel: any) => ({
+          name: `fwx-tunnel-probe-${tunnel.id}`,
+          addr: `:${tunnel.listenPort}`,
+          handler: { type: "tcp" },
+          listener: {
+            type: tunnelProtocolType(tunnel.mode),
+            ...(tunnelProtocolMetadata(tunnel.mode) ? { metadata: tunnelProtocolMetadata(tunnel.mode) } : {}),
+          },
+          forwarder: {
+            nodes: [{
+              name: `probe-${tunnel.id}`,
+              addr: "127.0.0.1:9",
+              connector: { type: "tcp" },
+              dialer: { type: "tcp" },
+            }],
+          },
+        }));
+      const ruleServices = tunnelExitRules.flatMap((rule: any) => {
+        const tunnel = tunnelById.get(rule.tunnelId) as any;
+        if (!tunnel || isForwardXTunnel(tunnel) || !rule.tunnelExitPort) return [];
+        return [{
+          name: `fwx-tunnel-exit-${tunnel.id}-${rule.id}`,
+          addr: `:${rule.tunnelExitPort}`,
+          handler: { type: "relay" },
+          listener: {
+            type: tunnelProtocolType(tunnel.mode),
+            ...(tunnelProtocolMetadata(tunnel.mode) ? { metadata: tunnelProtocolMetadata(tunnel.mode) } : {}),
+          },
+          forwarder: {
+            nodes: [{
+              name: `target-${rule.id}`,
+              addr: `${rule.targetIp}:${rule.targetPort}`,
+            }],
+          },
+        }];
+      });
+      const services = [...tunnelProbeServices, ...ruleServices];
+      const countingCmds = tunnelExitRules.flatMap((rule: any) => {
+        const tunnel = tunnelById.get(rule.tunnelId) as any;
+        if (!tunnel || isForwardXTunnel(tunnel) || !rule.tunnelExitPort) return [];
+        return buildCountingChainCmds(Number(rule.tunnelExitPort));
+      });
+      const encodedConfig = Buffer.from(JSON.stringify({ services }, null, 2), "utf8").toString("base64");
+      return [
+        `command -v /usr/local/bin/gost >/dev/null 2>&1 || command -v gost >/dev/null 2>&1`,
+        `mkdir -p /etc/forwardx-tunnels`,
+        `printf '%s' '${encodedConfig}' | base64 -d > /etc/forwardx-tunnels/config.json`,
+        writeUnitCmd("forwardx-tunnels", [
+          "[Unit]",
+          "Description=ForwardX managed gost tunnels",
+          "After=network.target",
+          "",
+          "[Service]",
+          "Type=simple",
+          "ExecStart=/usr/local/bin/gost -C /etc/forwardx-tunnels/config.json",
+          "Restart=always",
+          "RestartSec=5",
+          "LimitNOFILE=65535",
+          "",
+          "[Install]",
+          "WantedBy=multi-user.target",
+          "",
+        ].join("\n")),
+        `systemctl daemon-reload`,
+        `systemctl enable forwardx-tunnels.service 2>/dev/null || true`,
+        services.length > 0 ? `systemctl restart forwardx-tunnels.service` : `systemctl stop forwardx-tunnels.service 2>/dev/null || true`,
+        ...countingCmds,
+      ];
+    };
+
+    // 收集所有正在运行的规则的 port→ruleId 映射，用于 agent 重建映射文件
+    const ruleTrafficPort = (rule: any) => {
+      const tunnel = rule.tunnelId ? tunnelById.get(rule.tunnelId) as any : null;
+      if (tunnel && !isForwardXTunnel(tunnel) && tunnel.exitHostId === host.id && rule.tunnelExitPort) {
+        return Number(rule.tunnelExitPort);
+      }
+      if (tunnel && !isForwardXTunnel(tunnel)) return 0;
+      return Number(rule.sourcePort) || 0;
+    };
+    const runningRules: { ruleId: number; sourcePort: number; targetIp: string; targetPort: number; protocol: string; forwardType: string }[] = [];
+
+    const pendingTunnelExitRuleIds = new Set(
+      tunnelExitRules
+        .filter((rule: any) => !rule.isRunning)
+        .map((rule: any) => Number(rule.tunnelId))
+    );
+    for (const tunnel of hostTunnels as any[]) {
+      if (tunnel.exitHostId !== host.id) continue;
+      const fxpTunnel = isForwardXTunnel(tunnel);
+      const shouldRefreshExit = fxpTunnel
+        ? !tunnel.isRunning
+        : (!tunnel.isRunning || pendingTunnelExitRuleIds.has(Number(tunnel.id)));
+      if (tunnel.isEnabled && shouldRefreshExit) {
+        actions.push({
+          tunnelId: tunnel.id,
+          statusType: "tunnel",
+          ruleId: 0,
+          op: "apply",
+          forwardType: fxpTunnel ? "forwardx-tunnel" : "gost-tunnel",
+          sourcePort: tunnel.listenPort,
+          targetIp: host.ip,
+          targetPort: tunnel.listenPort,
+          protocol: "tcp",
+          commands: fxpTunnel ? [] : buildTunnelReloadCmds(),
+          fxp: fxpTunnel ? {
+            role: "exit",
+            tunnelId: tunnel.id,
+            ruleId: 0,
+            listenPort: tunnel.listenPort,
+            protocol: "both",
+            key: tunnelSecretSeed(tunnel),
+          } : undefined,
+        });
+      } else if (!tunnel.isEnabled && tunnel.isRunning) {
+        actions.push({
+          tunnelId: tunnel.id,
+          statusType: "tunnel",
+          ruleId: 0,
+          op: "remove",
+          forwardType: fxpTunnel ? "forwardx-tunnel" : "gost-tunnel",
+          sourcePort: tunnel.listenPort,
+          targetIp: host.ip,
+          targetPort: tunnel.listenPort,
+          protocol: "tcp",
+          commands: fxpTunnel ? [] : buildTunnelReloadCmds(),
+          fxp: fxpTunnel ? {
+            role: "exit",
+            tunnelId: tunnel.id,
+            ruleId: 0,
+            listenPort: tunnel.listenPort,
+            protocol: "both",
+            key: tunnelSecretSeed(tunnel),
+          } : undefined,
+        });
+      }
+    }
+
+    for (const rule of rules) {
+      // 收集所有已运行的规则映射（无论是否有 action 下发）
+      if (rule.isEnabled && rule.isRunning) {
+        const trafficPort = ruleTrafficPort(rule);
+        if (!trafficPort) continue;
+        runningRules.push({
+          ruleId: rule.id,
+          sourcePort: trafficPort,
+          targetIp: rule.targetIp,
+          targetPort: rule.targetPort,
+          protocol: rule.protocol,
+          forwardType: rule.forwardType,
+        });
+      }
+
+      if (rule.isEnabled && !rule.isRunning) {
+        const cmds: string[] = [];
+        if (rule.forwardType === "iptables") {
+          const proto = rule.protocol === "both" ? "tcp" : rule.protocol;
+          // 必须先启用内核转发，否则 DNAT 后数据包不会被路由到目标主机
+          cmds.push(`sysctl -w net.ipv4.ip_forward=1 >/dev/null`);
+          // 避免重复添加：先反向清理同 sourcePort 老规则
+          cmds.push(`while iptables -t nat -C PREROUTING -p tcp --dport ${rule.sourcePort} -j DNAT --to-destination ${rule.targetIp}:${rule.targetPort} 2>/dev/null; do iptables -t nat -D PREROUTING -p tcp --dport ${rule.sourcePort} -j DNAT --to-destination ${rule.targetIp}:${rule.targetPort}; done`);
+          cmds.push(`while iptables -t nat -C PREROUTING -p udp --dport ${rule.sourcePort} -j DNAT --to-destination ${rule.targetIp}:${rule.targetPort} 2>/dev/null; do iptables -t nat -D PREROUTING -p udp --dport ${rule.sourcePort} -j DNAT --to-destination ${rule.targetIp}:${rule.targetPort}; done`);
+
+          cmds.push(ipIfMissingT("nat", `PREROUTING -p ${proto} --dport ${rule.sourcePort} -j DNAT --to-destination ${rule.targetIp}:${rule.targetPort}`));
+          cmds.push(ipIfMissingT("nat", `POSTROUTING -p ${proto} -d ${rule.targetIp} --dport ${rule.targetPort} -j MASQUERADE`));
+          if (rule.protocol === "both") {
+            cmds.push(ipIfMissingT("nat", `PREROUTING -p udp --dport ${rule.sourcePort} -j DNAT --to-destination ${rule.targetIp}:${rule.targetPort}`));
+            cmds.push(ipIfMissingT("nat", `POSTROUTING -p udp -d ${rule.targetIp} --dport ${rule.targetPort} -j MASQUERADE`));
+          }
+          // FORWARD 默认 DROP 的发行版（如 Debian/Docker host）需要显式放行
+          cmds.push(ipIfMissing(`FORWARD -p ${proto} -d ${rule.targetIp} --dport ${rule.targetPort} -j ACCEPT`));
+          cmds.push(ipIfMissing(`FORWARD -p ${proto} -s ${rule.targetIp} --sport ${rule.targetPort} -m state --state ESTABLISHED,RELATED -j ACCEPT`));
+          if (rule.protocol === "both") {
+            cmds.push(ipIfMissing(`FORWARD -p udp -d ${rule.targetIp} --dport ${rule.targetPort} -j ACCEPT`));
+            cmds.push(ipIfMissing(`FORWARD -p udp -s ${rule.targetIp} --sport ${rule.targetPort} -j ACCEPT`));
+          }
+          // 挂入 mangle 计数链，为 Agent 采样提供准确流量计数器
+          for (const c of buildCountingChainCmds(rule.sourcePort)) cmds.push(c);
+          for (const c of buildAccessLimitCmds(rule.sourcePort, accessScopeForRule(rule), userAccessLimits(Number(rule.userId)))) cmds.push(c);
+          actions.push({
+            ruleId: rule.id,
+            op: "apply",
+            forwardType: rule.forwardType,
+            sourcePort: rule.sourcePort,
+            targetIp: rule.targetIp,
+            targetPort: rule.targetPort,
+            protocol: rule.protocol,
+            networkInterface: hostInterface,
+            commands: cmds,
+          });
+        } else if (rule.forwardType === "realm") {
+          const svcName = `forwardx-realm-${rule.sourcePort}`;
+          const udpFlag = rule.protocol === "udp" || rule.protocol === "both" ? "--udp" : "";
+          // 如果主机配置了网卡，realm 使用 --interface 绑定
+          const ifaceFlag = hostInterface ? `--interface ${hostInterface}` : "";
+          const realmCmd = `/usr/local/bin/realm -l 0.0.0.0:${rule.sourcePort} -r ${rule.targetIp}:${rule.targetPort} ${udpFlag} ${ifaceFlag}`.replace(/\s+/g, ' ').trim();
+          const unit = [
+            "[Unit]",
+            `Description=ForwardX realm forwarder ${rule.sourcePort}->${rule.targetIp}:${rule.targetPort}`,
+            "After=network.target",
+            "",
+            "[Service]",
+            "Type=simple",
+            `ExecStart=${realmCmd}`,
+            "Restart=always",
+            "RestartSec=5",
+            "LimitNOFILE=65535",
+            "",
+            "[Install]",
+            "WantedBy=multi-user.target",
+            "",
+          ].join("\n");
+          actions.push({
+            ruleId: rule.id,
+            op: "apply",
+            forwardType: rule.forwardType,
+            sourcePort: rule.sourcePort,
+            targetIp: rule.targetIp,
+            targetPort: rule.targetPort,
+            protocol: rule.protocol,
+            networkInterface: hostInterface,
+            svcName,
+            unit,
+            commands: [
+              `systemctl daemon-reload`,
+              `systemctl enable ${svcName}.service`,
+              `systemctl restart ${svcName}.service`,
+              // 同时为该端口挂入 mangle 计数链，保证 realm 转发也能被准确统计
+              ...buildCountingChainCmds(rule.sourcePort),
+              ...buildAccessLimitCmds(rule.sourcePort, accessScopeForRule(rule), userAccessLimits(Number(rule.userId))),
+            ],
+          });
+        } else if (rule.forwardType === "socat") {
+          // socat 转发：用户态进程，通过 systemd 管理
+          const svcName = `forwardx-socat-${rule.sourcePort}`;
+          const socatCmds: string[] = [];
+          // socat 需要安装
+          socatCmds.push(`command -v socat >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq socat || yum install -y -q socat || dnf install -y -q socat || apk add --no-cache socat; } 2>/dev/null`);
+
+          // 根据协议生成 socat 命令
+          // TCP: socat TCP-LISTEN:sourcePort,fork,reuseaddr TCP:targetIp:targetPort
+          // UDP: socat UDP-LISTEN:sourcePort,fork,reuseaddr UDP:targetIp:targetPort
+          // both: 需要两个 socat 进程
+          if (rule.protocol === "both") {
+            // 两个服务：一个 TCP 一个 UDP
+            const svcNameTcp = `forwardx-socat-tcp-${rule.sourcePort}`;
+            const svcNameUdp = `forwardx-socat-udp-${rule.sourcePort}`;
+            const unitTcp = [
+              "[Unit]",
+              `Description=ForwardX socat TCP forwarder ${rule.sourcePort}->${rule.targetIp}:${rule.targetPort}`,
+              "After=network.target",
+              "",
+              "[Service]",
+              "Type=simple",
+              `ExecStart=/usr/bin/socat TCP-LISTEN:${rule.sourcePort},fork,reuseaddr TCP:${rule.targetIp}:${rule.targetPort}`,
+              "Restart=always",
+              "RestartSec=5",
+              "LimitNOFILE=65535",
+              "",
+              "[Install]",
+              "WantedBy=multi-user.target",
+              "",
+            ].join("\n");
+            const unitUdp = [
+              "[Unit]",
+              `Description=ForwardX socat UDP forwarder ${rule.sourcePort}->${rule.targetIp}:${rule.targetPort}`,
+              "After=network.target",
+              "",
+              "[Service]",
+              "Type=simple",
+              `ExecStart=/usr/bin/socat UDP-LISTEN:${rule.sourcePort},fork,reuseaddr UDP:${rule.targetIp}:${rule.targetPort}`,
+              "Restart=always",
+              "RestartSec=5",
+              "LimitNOFILE=65535",
+              "",
+              "[Install]",
+              "WantedBy=multi-user.target",
+              "",
+            ].join("\n");
+            // socat both 模式下为该端口挂入 mangle 计数链
+            for (const c of buildCountingChainCmds(rule.sourcePort)) socatCmds.push(c);
+            for (const c of buildAccessLimitCmds(rule.sourcePort, accessScopeForRule(rule), userAccessLimits(Number(rule.userId)))) socatCmds.push(c);
+            actions.push({
+              ruleId: rule.id,
+              op: "apply",
+              forwardType: rule.forwardType,
+              sourcePort: rule.sourcePort,
+              targetIp: rule.targetIp,
+              targetPort: rule.targetPort,
+              protocol: rule.protocol,
+              networkInterface: hostInterface,
+              svcName: svcNameTcp,
+              svcNameExtra: svcNameUdp,
+              unit: unitTcp,
+              unitExtra: unitUdp,
+              commands: socatCmds,
+            });
+          } else {
+            const protoUpper = rule.protocol === "udp" ? "UDP" : "TCP";
+            const socatCmd = `/usr/bin/socat ${protoUpper}-LISTEN:${rule.sourcePort},fork,reuseaddr ${protoUpper}:${rule.targetIp}:${rule.targetPort}`;
+            const unit = [
+              "[Unit]",
+              `Description=ForwardX socat ${rule.protocol} forwarder ${rule.sourcePort}->${rule.targetIp}:${rule.targetPort}`,
+              "After=network.target",
+              "",
+              "[Service]",
+              "Type=simple",
+              `ExecStart=${socatCmd}`,
+              "Restart=always",
+              "RestartSec=5",
+              "LimitNOFILE=65535",
+              "",
+              "[Install]",
+              "WantedBy=multi-user.target",
+              "",
+            ].join("\n");
+            // socat 单协议模式下为该端口挂入 mangle 计数链
+            for (const c of buildCountingChainCmds(rule.sourcePort)) socatCmds.push(c);
+            for (const c of buildAccessLimitCmds(rule.sourcePort, accessScopeForRule(rule), userAccessLimits(Number(rule.userId)))) socatCmds.push(c);
+            actions.push({
+              ruleId: rule.id,
+              op: "apply",
+              forwardType: rule.forwardType,
+              sourcePort: rule.sourcePort,
+              targetIp: rule.targetIp,
+              targetPort: rule.targetPort,
+              protocol: rule.protocol,
+              networkInterface: hostInterface,
+              svcName,
+              unit,
+              commands: socatCmds,
+            });
+          }
+        } else if (rule.forwardType === "gost") {
+          const tunnel = (rule as any).tunnelId ? tunnelById.get((rule as any).tunnelId) as any : null;
+          if (tunnel && isForwardXTunnel(tunnel)) {
+            const tunnelExitHost = tunnelExitHostById.get(tunnel.id);
+            const rateLimits = userRateLimits(Number(rule.userId));
+            const accessLimits = userAccessLimits(Number(rule.userId));
+            actions.push({
+              ruleId: rule.id,
+              op: "apply",
+              forwardType: "forwardx",
+              sourcePort: rule.sourcePort,
+              targetIp: rule.targetIp,
+              targetPort: rule.targetPort,
+              protocol: rule.protocol,
+              networkInterface: hostInterface,
+              commands: [
+                ...buildGostReloadCmds(),
+                ...buildManagedPortCleanupCmds(rule.sourcePort),
+                ...buildCountingChainCmds(rule.sourcePort),
+              ],
+              fxp: {
+                role: "entry",
+                tunnelId: tunnel.id,
+                ruleId: rule.id,
+                listenPort: rule.sourcePort,
+                protocol: rule.protocol,
+                exitHost: tunnelExitHost,
+                exitPort: tunnel.listenPort,
+                targetIp: rule.targetIp,
+                targetPort: rule.targetPort,
+                key: tunnelSecretSeed(tunnel),
+                ...rateLimits,
+                ...accessLimits,
+                accessScope: accessScopeForRule(rule),
+              },
+            });
+            continue;
+          }
+          actions.push({
+            ruleId: rule.id,
+            op: "apply",
+            forwardType: rule.forwardType,
+            sourcePort: rule.sourcePort,
+            targetIp: rule.targetIp,
+            targetPort: rule.targetPort,
+            protocol: rule.protocol,
+            networkInterface: hostInterface,
+            commands: [
+              ...buildGostReloadCmds(),
+              ...buildCountingChainCmds(rule.sourcePort),
+              ...buildAccessLimitCmds(rule.sourcePort, accessScopeForRule(rule), userAccessLimits(Number(rule.userId))),
+            ],
+          });
+        }
+      } else if (!rule.isEnabled && rule.isRunning) {
+        const cmds: string[] = [];
+        if (rule.forwardType === "iptables") {
+          const proto = rule.protocol === "both" ? "tcp" : rule.protocol;
+          cmds.push(`iptables -t nat -D PREROUTING -p ${proto} --dport ${rule.sourcePort} -j DNAT --to-destination ${rule.targetIp}:${rule.targetPort} 2>/dev/null || true`);
+          cmds.push(`iptables -t nat -D POSTROUTING -p ${proto} -d ${rule.targetIp} --dport ${rule.targetPort} -j MASQUERADE 2>/dev/null || true`);
+          if (rule.protocol === "both") {
+            cmds.push(`iptables -t nat -D PREROUTING -p udp --dport ${rule.sourcePort} -j DNAT --to-destination ${rule.targetIp}:${rule.targetPort} 2>/dev/null || true`);
+            cmds.push(`iptables -t nat -D POSTROUTING -p udp -d ${rule.targetIp} --dport ${rule.targetPort} -j MASQUERADE 2>/dev/null || true`);
+          }
+          cmds.push(`iptables -D FORWARD -p ${proto} -d ${rule.targetIp} --dport ${rule.targetPort} -j ACCEPT 2>/dev/null || true`);
+          cmds.push(`iptables -D FORWARD -p ${proto} -s ${rule.targetIp} --sport ${rule.targetPort} -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true`);
+          // 清理 conntrack 流量状态文件
+          cmds.push(`rm -f /var/lib/forwardx-agent/traffic_${rule.sourcePort}.prev 2>/dev/null || true`);
+          cmds.push(`rm -f /var/lib/forwardx-agent/port_${rule.sourcePort}.rule 2>/dev/null || true`);
+          // 兼容清理旧版 mangle/filter 表计数链
+          cmds.push(`iptables -t mangle -D PREROUTING -p tcp --dport ${rule.sourcePort} -j FWX_IN_${rule.sourcePort} 2>/dev/null || true`);
+          cmds.push(`iptables -t mangle -D PREROUTING -p udp --dport ${rule.sourcePort} -j FWX_IN_${rule.sourcePort} 2>/dev/null || true`);
+          cmds.push(`iptables -t mangle -D POSTROUTING -p tcp --sport ${rule.sourcePort} -j FWX_OUT_${rule.sourcePort} 2>/dev/null || true`);
+          cmds.push(`iptables -t mangle -D POSTROUTING -p udp --sport ${rule.sourcePort} -j FWX_OUT_${rule.sourcePort} 2>/dev/null || true`);
+          cmds.push(`iptables -t mangle -F FWX_IN_${rule.sourcePort} 2>/dev/null || true`);
+          cmds.push(`iptables -t mangle -X FWX_IN_${rule.sourcePort} 2>/dev/null || true`);
+          cmds.push(`iptables -t mangle -F FWX_OUT_${rule.sourcePort} 2>/dev/null || true`);
+          cmds.push(`iptables -t mangle -X FWX_OUT_${rule.sourcePort} 2>/dev/null || true`);
+          cmds.push(`iptables -D FORWARD -p tcp -d ${rule.targetIp} --dport ${rule.targetPort} -j FWX_IN_${rule.sourcePort} 2>/dev/null || true`);
+          cmds.push(`iptables -D FORWARD -p udp -d ${rule.targetIp} --dport ${rule.targetPort} -j FWX_IN_${rule.sourcePort} 2>/dev/null || true`);
+          cmds.push(`iptables -D FORWARD -p tcp -s ${rule.targetIp} --sport ${rule.targetPort} -j FWX_OUT_${rule.sourcePort} 2>/dev/null || true`);
+          cmds.push(`iptables -D FORWARD -p udp -s ${rule.targetIp} --sport ${rule.targetPort} -j FWX_OUT_${rule.sourcePort} 2>/dev/null || true`);
+          cmds.push(`iptables -F FWX_IN_${rule.sourcePort} 2>/dev/null || true`);
+          cmds.push(`iptables -X FWX_IN_${rule.sourcePort} 2>/dev/null || true`);
+          cmds.push(`iptables -F FWX_OUT_${rule.sourcePort} 2>/dev/null || true`);
+          cmds.push(`iptables -X FWX_OUT_${rule.sourcePort} 2>/dev/null || true`);
+          for (const c of buildAccessLimitCleanupCmds(rule.sourcePort, accessScopeForRule(rule))) cmds.push(c);
+          actions.push({
+            ruleId: rule.id,
+            op: "remove",
+            forwardType: rule.forwardType,
+            sourcePort: rule.sourcePort,
+            targetIp: rule.targetIp,
+            targetPort: rule.targetPort,
+            protocol: rule.protocol,
+            commands: cmds,
+          });
+        } else if (rule.forwardType === "realm") {
+          const svcName = `forwardx-realm-${rule.sourcePort}`;
+          actions.push({
+            ruleId: rule.id,
+            op: "remove",
+            forwardType: rule.forwardType,
+            sourcePort: rule.sourcePort,
+            targetIp: rule.targetIp,
+            targetPort: rule.targetPort,
+            protocol: rule.protocol,
+            svcName,
+            commands: [
+              `systemctl stop ${svcName}.service 2>/dev/null || true`,
+              `systemctl disable ${svcName}.service 2>/dev/null || true`,
+              `rm -f /etc/systemd/system/${svcName}.service`,
+              `systemctl daemon-reload`,
+              `pkill -f "realm .*:${rule.sourcePort}" 2>/dev/null || true`,
+              // 清理 conntrack 流量状态文件
+              `rm -f /var/lib/forwardx-agent/traffic_${rule.sourcePort}.prev 2>/dev/null || true`,
+              `rm -f /var/lib/forwardx-agent/port_${rule.sourcePort}.rule 2>/dev/null || true`,
+              // 兼容清理旧版 mangle/filter 表计数链
+              `iptables -t mangle -D PREROUTING -p tcp --dport ${rule.sourcePort} -j FWX_IN_${rule.sourcePort} 2>/dev/null || true`,
+              `iptables -t mangle -D PREROUTING -p udp --dport ${rule.sourcePort} -j FWX_IN_${rule.sourcePort} 2>/dev/null || true`,
+              `iptables -t mangle -D POSTROUTING -p tcp --sport ${rule.sourcePort} -j FWX_OUT_${rule.sourcePort} 2>/dev/null || true`,
+              `iptables -t mangle -D POSTROUTING -p udp --sport ${rule.sourcePort} -j FWX_OUT_${rule.sourcePort} 2>/dev/null || true`,
+              `iptables -t mangle -F FWX_IN_${rule.sourcePort} 2>/dev/null || true`,
+              `iptables -t mangle -X FWX_IN_${rule.sourcePort} 2>/dev/null || true`,
+              `iptables -t mangle -F FWX_OUT_${rule.sourcePort} 2>/dev/null || true`,
+              `iptables -t mangle -X FWX_OUT_${rule.sourcePort} 2>/dev/null || true`,
+              `iptables -D INPUT -p tcp --dport ${rule.sourcePort} -j FWX_IN_${rule.sourcePort} 2>/dev/null || true`,
+              `iptables -D INPUT -p udp --dport ${rule.sourcePort} -j FWX_IN_${rule.sourcePort} 2>/dev/null || true`,
+              `iptables -D OUTPUT -p tcp --sport ${rule.sourcePort} -j FWX_OUT_${rule.sourcePort} 2>/dev/null || true`,
+              `iptables -D OUTPUT -p udp --sport ${rule.sourcePort} -j FWX_OUT_${rule.sourcePort} 2>/dev/null || true`,
+              `iptables -F FWX_IN_${rule.sourcePort} 2>/dev/null || true`,
+              `iptables -X FWX_IN_${rule.sourcePort} 2>/dev/null || true`,
+              `iptables -F FWX_OUT_${rule.sourcePort} 2>/dev/null || true`,
+              `iptables -X FWX_OUT_${rule.sourcePort} 2>/dev/null || true`,
+              ...buildAccessLimitCleanupCmds(rule.sourcePort, accessScopeForRule(rule)),
+            ],
+          });
+        } else if (rule.forwardType === "socat") {
+          const removeCmds: string[] = [];
+          if (rule.protocol === "both") {
+            const svcTcp = `forwardx-socat-tcp-${rule.sourcePort}`;
+            const svcUdp = `forwardx-socat-udp-${rule.sourcePort}`;
+            removeCmds.push(`systemctl stop ${svcTcp}.service 2>/dev/null || true`);
+            removeCmds.push(`systemctl disable ${svcTcp}.service 2>/dev/null || true`);
+            removeCmds.push(`rm -f /etc/systemd/system/${svcTcp}.service`);
+            removeCmds.push(`systemctl stop ${svcUdp}.service 2>/dev/null || true`);
+            removeCmds.push(`systemctl disable ${svcUdp}.service 2>/dev/null || true`);
+            removeCmds.push(`rm -f /etc/systemd/system/${svcUdp}.service`);
+          } else {
+            const svcName = `forwardx-socat-${rule.sourcePort}`;
+            removeCmds.push(`systemctl stop ${svcName}.service 2>/dev/null || true`);
+            removeCmds.push(`systemctl disable ${svcName}.service 2>/dev/null || true`);
+            removeCmds.push(`rm -f /etc/systemd/system/${svcName}.service`);
+          }
+          removeCmds.push(`systemctl daemon-reload`);
+          removeCmds.push(`pkill -f "socat.*LISTEN:${rule.sourcePort}" 2>/dev/null || true`);
+          // 清理 conntrack 流量状态文件
+          removeCmds.push(`rm -f /var/lib/forwardx-agent/traffic_${rule.sourcePort}.prev 2>/dev/null || true`);
+          removeCmds.push(`rm -f /var/lib/forwardx-agent/port_${rule.sourcePort}.rule 2>/dev/null || true`);
+          // 兼容清理旧版 mangle/filter 表计数链
+          removeCmds.push(`iptables -t mangle -D PREROUTING -p tcp --dport ${rule.sourcePort} -j FWX_IN_${rule.sourcePort} 2>/dev/null || true`);
+          removeCmds.push(`iptables -t mangle -D PREROUTING -p udp --dport ${rule.sourcePort} -j FWX_IN_${rule.sourcePort} 2>/dev/null || true`);
+          removeCmds.push(`iptables -t mangle -D POSTROUTING -p tcp --sport ${rule.sourcePort} -j FWX_OUT_${rule.sourcePort} 2>/dev/null || true`);
+          removeCmds.push(`iptables -t mangle -D POSTROUTING -p udp --sport ${rule.sourcePort} -j FWX_OUT_${rule.sourcePort} 2>/dev/null || true`);
+          removeCmds.push(`iptables -t mangle -F FWX_IN_${rule.sourcePort} 2>/dev/null || true`);
+          removeCmds.push(`iptables -t mangle -X FWX_IN_${rule.sourcePort} 2>/dev/null || true`);
+          removeCmds.push(`iptables -t mangle -F FWX_OUT_${rule.sourcePort} 2>/dev/null || true`);
+          removeCmds.push(`iptables -t mangle -X FWX_OUT_${rule.sourcePort} 2>/dev/null || true`);
+          removeCmds.push(`iptables -D INPUT -p tcp --dport ${rule.sourcePort} -j FWX_IN_${rule.sourcePort} 2>/dev/null || true`);
+          removeCmds.push(`iptables -D INPUT -p udp --dport ${rule.sourcePort} -j FWX_IN_${rule.sourcePort} 2>/dev/null || true`);
+          removeCmds.push(`iptables -D OUTPUT -p tcp --sport ${rule.sourcePort} -j FWX_OUT_${rule.sourcePort} 2>/dev/null || true`);
+          removeCmds.push(`iptables -D OUTPUT -p udp --sport ${rule.sourcePort} -j FWX_OUT_${rule.sourcePort} 2>/dev/null || true`);
+          removeCmds.push(`iptables -F FWX_IN_${rule.sourcePort} 2>/dev/null || true`);
+          removeCmds.push(`iptables -X FWX_IN_${rule.sourcePort} 2>/dev/null || true`);
+          removeCmds.push(`iptables -F FWX_OUT_${rule.sourcePort} 2>/dev/null || true`);
+          removeCmds.push(`iptables -X FWX_OUT_${rule.sourcePort} 2>/dev/null || true`);
+          for (const c of buildAccessLimitCleanupCmds(rule.sourcePort, accessScopeForRule(rule))) removeCmds.push(c);
+          actions.push({
+            ruleId: rule.id,
+            op: "remove",
+            forwardType: rule.forwardType,
+            sourcePort: rule.sourcePort,
+            targetIp: rule.targetIp,
+            targetPort: rule.targetPort,
+            protocol: rule.protocol,
+            commands: removeCmds,
+          });
+        } else if (rule.forwardType === "gost") {
+          const tunnel = (rule as any).tunnelId ? tunnelById.get((rule as any).tunnelId) as any : null;
+          const removeCmds: string[] = [
+            ...buildGostReloadCmds(),
+            ...buildManagedPortCleanupCmds(rule.sourcePort),
+          ];
+          actions.push({
+            ruleId: rule.id,
+            op: "remove",
+            forwardType: rule.forwardType,
+            sourcePort: rule.sourcePort,
+            targetIp: rule.targetIp,
+            targetPort: rule.targetPort,
+            protocol: rule.protocol,
+            commands: removeCmds,
+            fxp: tunnel && isForwardXTunnel(tunnel) ? {
+              role: "entry",
+              tunnelId: tunnel.id,
+              ruleId: rule.id,
+              listenPort: rule.sourcePort,
+              protocol: rule.protocol,
+              key: tunnelSecretSeed(tunnel),
+            } : undefined,
+          });
+        }
+      }
+    }
+
+    // 取走该主机的 pending 转发自测任务并标为 running
+    for (const rule of tunnelExitRules) {
+      if (!rule.isEnabled || !rule.isRunning) continue;
+      const trafficPort = Number((rule as any).tunnelExitPort) || 0;
+      if (!trafficPort) continue;
+      runningRules.push({
+        ruleId: rule.id,
+        sourcePort: trafficPort,
+        targetIp: rule.targetIp,
+        targetPort: rule.targetPort,
+        protocol: rule.protocol,
+        forwardType: "gost-tunnel-exit",
+      });
+    }
+
+    const pendingTests = await db.getPendingForwardTestsByHost(host.id);
+    const selfTests: any[] = [];
+    for (const t of pendingTests) {
+      await db.markForwardTestRunning(t.id);
+      const meta = parseSelfTestMeta((t as any).message);
+      if (meta?.kind === "tunnel") {
+        selfTests.push({
+          testId: t.id,
+          kind: "tunnel",
+          tunnelId: meta.tunnelId,
+          ruleId: 0,
+          forwardType: "gost-tunnel",
+          protocol: "tcp",
+          sourcePort: 0,
+          targetIp: meta.targetIp,
+          targetPort: meta.targetPort,
+        });
+        continue;
+      }
+      const rule = await db.getForwardRuleById(t.ruleId);
+      if (!rule) continue;
+      selfTests.push({
+        testId: t.id,
+        ruleId: rule.id,
+        forwardType: rule.forwardType,
+        protocol: rule.protocol,
+        sourcePort: rule.sourcePort,
+        targetIp: rule.targetIp,
+        targetPort: rule.targetPort,
+      });
+    }
+
+    const requestedTargetVersion = (host as any).agentUpgradeTargetVersion || AGENT_VERSION;
+    const agentUpgradeCompleted = (host as any).agentUpgradeRequested
+      && agentVersion
+      && compareVersions(agentVersion, requestedTargetVersion) >= 0;
+    if (agentUpgradeCompleted) {
+      await db.clearHostAgentUpgradeRequest(host.id);
+    }
+    const agentUpgrade = (host as any).agentUpgradeRequested && !agentUpgradeCompleted ? {
+      targetVersion: requestedTargetVersion,
+      panelUrl: await resolvePanelUrl(req),
+    } : null;
+
+    res.json({ success: true, actions, selfTests, runningRules, tunnelProbes, agentUpgrade, nextInterval: isHostMetricsWatching(host.id) ? 2 : 30 });
+  } catch (error) {
+    console.error("[Agent Heartbeat] Error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Agent 规则状态回调
+
+}

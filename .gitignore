@@ -39,6 +39,8 @@ yarn.lock
 tmp/
 temp/
 .cache/
+.gocache/
+.tmp-*/
 
 # Local Docker deployment bundle generated for manual upload
 docker/Forwardx/

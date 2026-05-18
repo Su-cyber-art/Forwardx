@@ -1,5 +1,14 @@
 # Changelog
 
+## [2.2.42] - 2026-05-18
+
+### Changed
+
+- Split the large server router, database, and Agent route files into focused modules.
+- Added architecture documentation and Agent DTO guards for safer inbound report handling.
+- Moved the rules TCPing detail dialog into a dedicated frontend component.
+- Bumped panel version to 2.2.42. Agent version remains 2.2.36.
+
 ## [2.2.41] - 2026-05-18
 
 ### Changed
