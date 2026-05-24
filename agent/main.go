@@ -27,7 +27,7 @@ import (
 	"time"
 )
 
-var Version = "2.2.47"
+var Version = "2.2.48"
 var upgradeStarted int32
 var fxpMu sync.Mutex
 var fxpServers = map[string]*fxpProcess{}
@@ -271,7 +271,9 @@ func heartbeat(cfg Config) (int, error) {
 	syncRunningRuleState(resp.RunningRules)
 	for _, r := range resp.RunningRules {
 		writeRunningRuleState(r)
-		ensureCountingChains(r.SourcePort)
+		if r.ForwardType != "nftables" {
+			ensureCountingChains(r.SourcePort)
+		}
 	}
 	syncProtocolGuards(cfg, resp.GuardRules)
 	collectTraffic(cfg)
@@ -512,6 +514,9 @@ func reconcileRemovePort(port string) {
 	if forwardType == "forwardx" && ruleID > 0 {
 		stopFXP(fxpSpec{Role: "entry", RuleID: ruleID, ListenPort: atoi(port), Protocol: "both"})
 	}
+	if forwardType == "nftables" && ruleID > 0 {
+		_ = runShell("nft list table inet forwardx >/dev/null 2>&1 && { for h in $(nft -a list chain inet forwardx prerouting 2>/dev/null | awk -v c=\"fwx-rule-" + strconv.Itoa(ruleID) + "\" '$0 ~ c {print $NF}'); do nft delete rule inet forwardx prerouting handle \"$h\" 2>/dev/null || true; done; for h in $(nft -a list chain inet forwardx postrouting 2>/dev/null | awk -v c=\"fwx-rule-" + strconv.Itoa(ruleID) + "\" '$0 ~ c {print $NF}'); do nft delete rule inet forwardx postrouting handle \"$h\" 2>/dev/null || true; done; for h in $(nft -a list chain inet forwardx forward 2>/dev/null | awk -v c=\"fwx-rule-" + strconv.Itoa(ruleID) + "\" '$0 ~ c {print $NF}'); do nft delete rule inet forwardx forward handle \"$h\" 2>/dev/null || true; done; nft flush chain inet forwardx in_" + strconv.Itoa(ruleID) + " 2>/dev/null || true; nft delete chain inet forwardx in_" + strconv.Itoa(ruleID) + " 2>/dev/null || true; nft flush chain inet forwardx out_" + strconv.Itoa(ruleID) + " 2>/dev/null || true; nft delete chain inet forwardx out_" + strconv.Itoa(ruleID) + " 2>/dev/null || true; } || true")
+	}
 	for _, cmd := range managedPortCleanupCmds(port) {
 		_ = runShell(cmd)
 	}
@@ -600,8 +605,11 @@ func collectTraffic(cfg Config) {
 		if ruleID <= 0 {
 			continue
 		}
-		in := iptablesBytes("FWX_IN_" + port)
-		out := iptablesBytes("FWX_OUT_" + port)
+		forwardType := readForwardTypeByPort(port)
+		in, out := iptablesBytes("FWX_IN_"+port), iptablesBytes("FWX_OUT_"+port)
+		if forwardType == "nftables" {
+			in, out = nftablesBytes(ruleID, port)
+		}
 		prevIn, prevOut := readPrev(port)
 		din, dout := delta(in, prevIn), delta(out, prevOut)
 		writePrev(port, in, out)
@@ -713,6 +721,22 @@ func iptablesBytes(chain string) uint64 {
 		parentChains = "POSTROUTING OUTPUT"
 	}
 	cmd := fmt.Sprintf(`for c in %s; do iptables -t mangle -nvxL "$c" 2>/dev/null; done | awk -v ch=%s '$0 ~ ch {s+=$2} END{print s+0}'`, parentChains, shellQuote(chain))
+	out, err := exec.Command("sh", "-lc", cmd).Output()
+	if err != nil {
+		return 0
+	}
+	v, _ := strconv.ParseUint(strings.TrimSpace(string(out)), 10, 64)
+	return v
+}
+
+func nftablesBytes(ruleID int, port string) (uint64, uint64) {
+	in := nftablesChainBytes("in_" + strconv.Itoa(ruleID))
+	out := nftablesChainBytes("out_" + strconv.Itoa(ruleID))
+	return in, out
+}
+
+func nftablesChainBytes(chain string) uint64 {
+	cmd := fmt.Sprintf(`nft -a list chain inet forwardx %s 2>/dev/null | awk '/counter packets/ {for(i=1;i<=NF;i++) if($i=="bytes") {s+=$(i+1)}} END{print s+0}'`, shellQuote(chain))
 	out, err := exec.Command("sh", "-lc", cmd).Output()
 	if err != nil {
 		return 0

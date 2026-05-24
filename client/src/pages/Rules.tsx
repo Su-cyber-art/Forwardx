@@ -246,9 +246,6 @@ function RulesContent() {
       ...prev,
       routeMode: mode,
       forwardType: nextForwardType,
-      gostMode: "direct",
-      gostRelayHost: mode === "tunnel" ? "" : prev.gostRelayHost,
-      gostRelayPort: mode === "tunnel" ? 0 : prev.gostRelayPort,
       tunnelId: mode === "tunnel" ? prev.tunnelId : null,
       hostId: mode === "tunnel" && selectedTunnel ? selectedTunnel.entryHostId : prev.hostId,
     }));
@@ -293,9 +290,9 @@ function RulesContent() {
       routeMode: rule.forwardType === "gost" && rule.tunnelId ? "tunnel" : "local",
       forwardType: rule.forwardType,
       protocol: rule.protocol,
-      gostMode: rule.gostMode || "direct",
-      gostRelayHost: rule.gostRelayHost || "",
-      gostRelayPort: rule.gostRelayPort || 0,
+      gostMode: "direct",
+      gostRelayHost: "",
+      gostRelayPort: 0,
       tunnelId: rule.tunnelId || null,
       sourcePort: rule.sourcePort,
       targetIp: rule.targetIp,
@@ -437,7 +434,7 @@ function RulesContent() {
     if (form.routeMode !== "local") return;
     if (usableForwardTypes.length === 0) return;
     if (!usableForwardTypes.includes(form.forwardType)) {
-      setForm((prev) => ({ ...prev, forwardType: usableForwardTypes[0], gostMode: usableForwardTypes[0] === "gost" ? prev.gostMode : "direct", tunnelId: null }));
+      setForm((prev) => ({ ...prev, forwardType: usableForwardTypes[0], tunnelId: null }));
     }
   }, [form.forwardType, form.routeMode, usableForwardTypes]);
 
@@ -486,14 +483,6 @@ function RulesContent() {
       toast.error("目标端口必须在 1-65535 之间");
       return;
     }
-    if (form.routeMode === "local" && form.forwardType === "gost" && form.gostMode === "reverse" && (!form.gostRelayHost || !form.gostRelayPort)) {
-      toast.error("请填写 gost 反向隧道的中继地址和端口");
-      return;
-    }
-    if (form.routeMode === "local" && form.forwardType === "gost" && form.gostMode === "reverse" && !isValidPort(form.gostRelayPort)) {
-      toast.error("中继端口必须在 1-65535 之间");
-      return;
-    }
     if (portStatus === "used") {
       toast.error("源端口已被占用，请更换端口或使用随机分配");
       return;
@@ -504,9 +493,9 @@ function RulesContent() {
         name: form.name,
         forwardType: form.routeMode === "tunnel" ? "gost" : form.forwardType,
         protocol: form.protocol,
-        gostMode: form.routeMode === "tunnel" ? "direct" : form.forwardType === "gost" ? form.gostMode : "direct",
-        gostRelayHost: form.routeMode === "local" && form.forwardType === "gost" && form.gostMode === "reverse" ? form.gostRelayHost : null,
-        gostRelayPort: form.routeMode === "local" && form.forwardType === "gost" && form.gostMode === "reverse" ? form.gostRelayPort : null,
+        gostMode: "direct",
+        gostRelayHost: null,
+        gostRelayPort: null,
         tunnelId: form.routeMode === "tunnel" ? form.tunnelId : null,
         sourcePort: form.sourcePort,
         targetIp: form.targetIp,
@@ -518,9 +507,9 @@ function RulesContent() {
         name: form.name,
         forwardType: form.routeMode === "tunnel" ? "gost" : form.forwardType,
         protocol: form.protocol,
-        gostMode: form.routeMode === "tunnel" ? "direct" : form.forwardType === "gost" ? form.gostMode : "direct",
-        gostRelayHost: form.routeMode === "local" && form.forwardType === "gost" && form.gostMode === "reverse" ? form.gostRelayHost : null,
-        gostRelayPort: form.routeMode === "local" && form.forwardType === "gost" && form.gostMode === "reverse" ? form.gostRelayPort : null,
+        gostMode: "direct",
+        gostRelayHost: null,
+        gostRelayPort: null,
         tunnelId: form.routeMode === "tunnel" ? form.tunnelId : null,
         sourcePort: form.sourcePort,
         targetIp: form.targetIp,
@@ -613,7 +602,7 @@ function RulesContent() {
     <Badge
       variant="outline"
       className={`whitespace-nowrap text-[10px] ${
-        rule.forwardType === "iptables"
+        rule.forwardType === "iptables" || rule.forwardType === "nftables"
           ? "border-primary/30 text-primary"
           : rule.forwardType === "socat"
           ? "border-chart-5/30 text-chart-5"
@@ -626,6 +615,8 @@ function RulesContent() {
         <><Network className="h-3 w-3 mr-1" />{tunnelDisplayById.get(Number(rule.tunnelId))?.badgeLabel || "隧道"}</>
       ) : rule.forwardType === "iptables" ? (
         <><Shield className="h-3 w-3 mr-1" />iptables</>
+      ) : rule.forwardType === "nftables" ? (
+        <><Shield className="h-3 w-3 mr-1" />nftables</>
       ) : rule.forwardType === "socat" ? (
         <><ArrowRightLeft className="h-3 w-3 mr-1" />socat</>
       ) : rule.forwardType === "gost" ? (
@@ -729,7 +720,7 @@ function RulesContent() {
         <div>
           <h1 className="text-xl sm:text-2xl font-bold tracking-tight">转发规则</h1>
           <p className="text-muted-foreground mt-1 text-xs sm:text-sm">
-            管理端口转发规则，支持 iptables、realm、socat 和 gost
+            管理端口转发规则，支持 iptables、nftables、realm、socat 和 gost
           </p>
         </div>
         <div className="flex items-center gap-2 sm:gap-3">
@@ -782,6 +773,7 @@ function RulesContent() {
             <SelectContent>
               <SelectItem value="all">所有类型</SelectItem>
               <SelectItem value="iptables">iptables</SelectItem>
+              <SelectItem value="nftables">nftables</SelectItem>
               <SelectItem value="realm">realm</SelectItem>
               <SelectItem value="socat">socat</SelectItem>
               <SelectItem value="gost">gost</SelectItem>
@@ -1147,7 +1139,7 @@ function RulesContent() {
                 ) : (
                   <Select
                     value={form.forwardType}
-                    onValueChange={(v) => setForm({ ...form, forwardType: v as any, gostMode: v === "gost" ? form.gostMode : "direct", tunnelId: null })}
+                    onValueChange={(v) => setForm({ ...form, forwardType: v as any, gostMode: "direct", gostRelayHost: "", gostRelayPort: 0, tunnelId: null })}
                   >
                     <SelectTrigger><SelectValue /></SelectTrigger>
                     <SelectContent>
@@ -1232,83 +1224,6 @@ function RulesContent() {
                 随机端口
               </Button>
             </div>
-
-            {form.routeMode === "local" && (
-              <div className={`rounded-lg border border-border/40 bg-muted/20 p-3 space-y-3 ${form.forwardType !== "gost" ? "opacity-60" : ""}`}>
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                  <div className="space-y-2">
-                    <Label>gost 模式</Label>
-                    <Select
-                      value={form.gostMode}
-                      disabled={form.forwardType !== "gost"}
-                      onValueChange={(v) => setForm({ ...form, gostMode: v as any, tunnelId: v === "direct" ? form.tunnelId : null })}
-                    >
-                      <SelectTrigger><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="direct">端口转发</SelectItem>
-                        <SelectItem value="reverse">反向隧道</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  {form.gostMode === "reverse" && (
-                    <>
-                      <div className="space-y-2">
-                        <Label>中继地址</Label>
-                        <Input
-                          placeholder="例如: relay.example.com"
-                          disabled={form.forwardType !== "gost" || form.gostMode !== "reverse"}
-                          value={form.gostRelayHost}
-                          onChange={(e) => setForm({ ...form, gostRelayHost: e.target.value })}
-                        />
-                      </div>
-                      <div className="space-y-2">
-                        <Label>中继端口</Label>
-                        <Input
-                          type="number"
-                          min={1}
-                          max={65535}
-                          step={1}
-                          placeholder="例如: 8443"
-                          disabled={form.forwardType !== "gost" || form.gostMode !== "reverse"}
-                          value={form.gostRelayPort || ""}
-                          onChange={(e) => setForm({ ...form, gostRelayPort: parseInt(e.target.value) || 0 })}
-                        />
-                      </div>
-                    </>
-                  )}
-                </div>
-                {form.gostMode === "direct" && (
-                  <div className="space-y-2">
-                    <Label>使用隧道</Label>
-                    <Select
-                      value={form.tunnelId ? String(form.tunnelId) : "none"}
-                      disabled={form.forwardType !== "gost" || availableTunnels.length === 0}
-                      onValueChange={(v) => setForm({ ...form, tunnelId: v === "none" ? null : Number(v) })}
-                    >
-                      <SelectTrigger><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="none">不使用隧道</SelectItem>
-                        {availableTunnels.map((t: any) => (
-                          <SelectItem key={t.id} value={String(t.id)}>
-                            {t.name} / {String(t.mode).toUpperCase()} / :{t.listenPort}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                )}
-                {form.gostMode === "reverse" && (
-                  <p className="text-xs text-muted-foreground">
-                    反向隧道会保存中继参数并下发到 Agent，适合内网主机主动连出到公网中继。
-                  </p>
-                )}
-                {form.forwardType !== "gost" && (
-                  <p className="text-xs text-muted-foreground">
-                    选择 gost 转发工具后可配置 gost 模式。
-                  </p>
-                )}
-              </div>
-            )}
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div className="space-y-2">

@@ -760,15 +760,19 @@ function HostsContent() {
           </Card>
         )
       ) : (
-        <div className="flex flex-col items-center justify-center py-20 text-muted-foreground">
-          <div className="h-16 w-16 rounded-2xl bg-muted/30 flex items-center justify-center mb-4">
-            <Server className="h-8 w-8 opacity-40" />
-          </div>
-          <p className="text-lg font-medium">暂无主机</p>
-          <p className="text-sm mt-1 text-muted-foreground/60">
-            请联系管理员添加主机
-          </p>
-        </div>
+        <Card className="border-border/40 bg-card/60 backdrop-blur-md">
+          <CardContent className="p-0">
+            <div className="flex flex-col items-center justify-center py-20 text-muted-foreground">
+              <div className="h-16 w-16 rounded-2xl bg-muted/30 flex items-center justify-center mb-4">
+                <Server className="h-8 w-8 opacity-40" />
+              </div>
+              <p className="text-lg font-medium">暂无主机</p>
+              <p className="text-sm mt-1 text-muted-foreground/60">
+                请联系管理员添加主机
+              </p>
+            </div>
+          </CardContent>
+        </Card>
       )}
 
       {/* Agent Upgrade Dialog */}

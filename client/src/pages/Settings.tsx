@@ -1629,7 +1629,7 @@ function SystemInfoSection() {
             <div className="space-y-2 rounded-lg border border-border/40 bg-muted/20 p-3">
               <div>
                 <p className="text-sm font-medium">端口转发</p>
-                <p className="text-xs text-muted-foreground">控制规则中的 iptables、realm、socat、gost 转发工具。</p>
+                <p className="text-xs text-muted-foreground">控制规则中的 iptables、nftables、realm、socat、gost 转发工具。</p>
               </div>
               <div className="flex flex-col gap-2">
                 {directForwardProtocolKeys.map((key) => (

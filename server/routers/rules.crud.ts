@@ -55,7 +55,7 @@ export const crudRulesRouter = router({
         }
       }
 
-      const tunnelId = input.forwardType === "gost" && input.gostMode === "direct" ? input.tunnelId ?? null : null;
+      const tunnelId = input.forwardType === "gost" ? input.tunnelId ?? null : null;
       let selectedTunnelForRule: any = null;
       let isTrafficBillingRule = false;
       if (tunnelId) {
@@ -109,13 +109,9 @@ export const crudRulesRouter = router({
         }
       }
 
-      const gostRelayHost = input.forwardType === "gost" && input.gostMode === "reverse" ? (input.gostRelayHost || "").trim() : null;
-      const gostRelayPort = input.forwardType === "gost" && input.gostMode === "reverse" ? input.gostRelayPort : null;
+      const gostRelayHost = null;
+      const gostRelayPort = null;
       let tunnelExitPort: number | null = null;
-      if (input.forwardType === "gost" && input.gostMode === "reverse") {
-        if (!gostRelayHost) throw new Error("反向隧道需要填写中继地址");
-        if (!gostRelayPort) throw new Error("反向隧道需要填写中继端口");
-      }
 
       if (tunnelId) {
         const tunnel = selectedTunnelForRule ?? (await requireTunnelUseOrTrafficBillingAccess(ctx, tunnelId)).tunnel;
@@ -132,7 +128,7 @@ export const crudRulesRouter = router({
         if (!tunnelExitPort) throw new Error("出口 Agent 已无可用隧道端口");
       }
 
-      const id = await db.createForwardRule({ ...input, sourcePort, gostRelayHost, gostRelayPort, tunnelId, tunnelExitPort, userId: ctx.user.id });
+      const id = await db.createForwardRule({ ...input, sourcePort, gostMode: "direct", gostRelayHost, gostRelayPort, tunnelId, tunnelExitPort, userId: ctx.user.id });
       if (tunnelId) {
         const tunnel = await db.getTunnelById(tunnelId);
         await db.updateTunnel(tunnelId, { isRunning: false } as any);
@@ -169,8 +165,7 @@ export const crudRulesRouter = router({
       {
         const nextForwardType = input.forwardType ?? rule.forwardType;
         nextForwardTypeForRule = nextForwardType;
-        const nextGostMode = input.gostMode ?? (rule as any).gostMode ?? "direct";
-        nextTunnelIdForRule = nextForwardType === "gost" && nextGostMode === "direct"
+        nextTunnelIdForRule = nextForwardType === "gost"
           ? (input.tunnelId !== undefined ? input.tunnelId : (rule as any).tunnelId)
           : null;
         if (nextTunnelIdForRule) {
@@ -222,13 +217,8 @@ export const crudRulesRouter = router({
         (data as any).gostRelayHost = null;
         (data as any).gostRelayPort = null;
         (data as any).tunnelId = null;
-      } else if ((data.gostMode ?? (rule as any).gostMode ?? "direct") === "reverse") {
-        const relayHost = data.gostRelayHost !== undefined ? data.gostRelayHost : (rule as any).gostRelayHost;
-        const relayPort = data.gostRelayPort !== undefined ? data.gostRelayPort : (rule as any).gostRelayPort;
-        if (!relayHost) throw new Error("反向隧道需要填写中继地址");
-        if (!relayPort) throw new Error("反向隧道需要填写中继端口");
-        (data as any).tunnelId = null;
       } else {
+        (data as any).gostMode = "direct";
         (data as any).gostRelayHost = null;
         (data as any).gostRelayPort = null;
         const nextTunnelId = data.tunnelId !== undefined ? data.tunnelId : (rule as any).tunnelId;

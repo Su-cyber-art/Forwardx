@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.2.64] - 2026-05-25
+
+### Added
+
+- Added nftables as a forwarding option with panel permissions, rule display, Agent apply/remove commands, and traffic accounting.
+- Added footer links for the open-source project and author Telegram support bot for all logged-in users.
+
+### Changed
+
+- Limited GOST in port forwarding to direct port forwarding and removed reverse-tunnel and tunnel selection options from that form.
+- Unified empty-state styling for host and tunnel management and removed the regional wording from GOST tunnel configuration.
+- Bumped panel version to 2.2.64 and Agent target version to 2.2.48.
+
 ## [2.2.63] - 2026-05-24
 
 ### Fixed

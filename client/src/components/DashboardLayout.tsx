@@ -158,6 +158,11 @@ function DashboardLayoutContent({
     refetchOnWindowFocus: false,
     retry: false,
   });
+  const { data: publicInfo } = trpc.system.publicInfo.useQuery(undefined, {
+    enabled: !!user,
+    refetchOnWindowFocus: false,
+    retry: false,
+  });
   const [showAnnouncement, setShowAnnouncement] = useState(false);
   const [showTelegramDialog, setShowTelegramDialog] = useState(false);
   const [telegramBind, setTelegramBind] = useState<any | null>(null);
@@ -538,6 +543,27 @@ function DashboardLayoutContent({
           </div>
         )}
         <main className="flex-1 p-3 sm:p-6">{children}</main>
+        <footer className="pb-4 text-center text-xs text-muted-foreground">
+          <div className="inline-flex flex-wrap items-center justify-center gap-x-3 gap-y-1">
+            <a
+              href={publicInfo?.repoUrl || "https://github.com/poouo/Forwardx"}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="transition-colors hover:text-foreground"
+            >
+              开源项目
+            </a>
+            <span className="text-muted-foreground/45">/</span>
+            <a
+              href={publicInfo?.telegramBotUrl || "https://t.me/miyin_private_bot"}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="transition-colors hover:text-foreground"
+            >
+              作者 TG 双向聊天机器人
+            </a>
+          </div>
+        </footer>
       </SidebarInset>
 
       {/* Change Password Dialog */}

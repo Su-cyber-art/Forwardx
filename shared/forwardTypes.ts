@@ -1,9 +1,10 @@
-export const FORWARD_TYPES = ["iptables", "realm", "socat", "gost"] as const;
+export const FORWARD_TYPES = ["iptables", "nftables", "realm", "socat", "gost"] as const;
 
 export type ForwardType = (typeof FORWARD_TYPES)[number];
 
 export const FORWARD_TYPE_LABELS: Record<ForwardType, string> = {
   iptables: "iptables",
+  nftables: "nftables",
   realm: "realm",
   socat: "socat",
   gost: "gost",
@@ -19,6 +20,7 @@ export type ForwardProtocolSettings = Record<ForwardProtocolKey, boolean>;
 
 export const FORWARD_PROTOCOL_LABELS: Record<ForwardProtocolKey, string> = {
   iptables: "iptables",
+  nftables: "nftables",
   realm: "realm",
   socat: "socat",
   gost: "gost",
@@ -33,6 +35,7 @@ export const FORWARD_PROTOCOL_LABELS: Record<ForwardProtocolKey, string> = {
 
 export const DEFAULT_FORWARD_PROTOCOL_SETTINGS: ForwardProtocolSettings = {
   iptables: true,
+  nftables: true,
   realm: true,
   socat: true,
   gost: true,

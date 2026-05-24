@@ -686,13 +686,17 @@ function TunnelsContent() {
           </CardContent>
         </Card>
       ) : (
-        <div className="flex flex-col items-center justify-center py-20 text-muted-foreground">
-          <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-muted/30">
-            <Network className="h-8 w-8 opacity-40" />
-          </div>
-          <p className="text-lg font-medium">暂无隧道</p>
-          <p className="mt-1 text-sm text-muted-foreground/60">选择两台 Agent 创建第一条隧道</p>
-        </div>
+        <Card className="border-border/40 bg-card/60 backdrop-blur-md">
+          <CardContent className="p-0">
+            <div className="flex flex-col items-center justify-center py-20 text-muted-foreground">
+              <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-muted/30">
+                <Network className="h-8 w-8 opacity-40" />
+              </div>
+              <p className="text-lg font-medium">暂无隧道</p>
+              <p className="mt-1 text-sm text-muted-foreground/60">选择两台 Agent 创建第一条隧道</p>
+            </div>
+          </CardContent>
+        </Card>
       )}
 
       {latencyTunnel && (
@@ -769,7 +773,7 @@ function TunnelsContent() {
               <div className="space-y-2 rounded-lg border border-border/70 bg-muted/20 p-3">
                 <div className="flex items-center gap-2">
                   <Globe2 className="h-4 w-4 text-muted-foreground" />
-                  <Label>中国入口 → 海外出口可选配置</Label>
+                  <Label>入口 → 出口可选配置</Label>
                 </div>
                 <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
                   {gostTunnelOptions.filter((preset) => enabledGostTunnelModes.includes(preset.mode)).map((preset) => (

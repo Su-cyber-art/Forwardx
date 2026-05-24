@@ -138,6 +138,7 @@ function UsersContent() {
   const [maxIPs, setMaxIPs] = useState(0);
   // 允许使用的转发方式：默认三种全部允许
   const [allowIptables, setAllowIptables] = useState(true);
+  const [allowNftables, setAllowNftables] = useState(true);
   const [allowRealm, setAllowRealm] = useState(true);
   const [allowSocat, setAllowSocat] = useState(true);
   const [allowGost, setAllowGost] = useState(true);
@@ -403,10 +404,11 @@ function UsersContent() {
     // 转发方式权限：allowedForwardTypes 为 null 表示全部允许，空串表示全部禁用
     const allowedRaw = (u.allowedForwardTypes as string | null) || "";
     if (u.allowedForwardTypes === null || u.allowedForwardTypes === undefined) {
-      setAllowIptables(true); setAllowRealm(true); setAllowSocat(true); setAllowGost(true);
+      setAllowIptables(true); setAllowNftables(true); setAllowRealm(true); setAllowSocat(true); setAllowGost(true);
     } else {
       const set = new Set(allowedRaw.split(",").map((s: string) => s.trim()));
       setAllowIptables(set.has("iptables"));
+      setAllowNftables(set.has("nftables"));
       setAllowRealm(set.has("realm"));
       setAllowSocat(set.has("socat"));
       setAllowGost(set.has("gost"));
@@ -424,6 +426,7 @@ function UsersContent() {
     // 拼接转发方式权限：三种都允许时传 null（后端为 null 表示全部）
     const allowed: string[] = [];
     if (allowIptables) allowed.push("iptables");
+    if (allowNftables) allowed.push("nftables");
     if (allowRealm) allowed.push("realm");
     if (allowSocat) allowed.push("socat");
     if (allowGost) allowed.push("gost");
@@ -1082,10 +1085,14 @@ function UsersContent() {
               <div className="space-y-2">
                 <Label className="text-sm font-medium">允许使用的转发方式</Label>
                 <p className="text-xs text-muted-foreground">全部关闭将禁止创建任何转发方式；留空权限时才表示默认全部允许。</p>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
                   <div className="flex items-center justify-between rounded-lg border border-border/40 p-2">
                     <span className="text-xs font-medium">iptables</span>
                     <Switch checked={allowIptables} onCheckedChange={setAllowIptables} />
+                  </div>
+                  <div className="flex items-center justify-between rounded-lg border border-border/40 p-2">
+                    <span className="text-xs font-medium">nftables</span>
+                    <Switch checked={allowNftables} onCheckedChange={setAllowNftables} />
                   </div>
                   <div className="flex items-center justify-between rounded-lg border border-border/40 p-2">
                     <span className="text-xs font-medium">realm</span>
@@ -1137,7 +1144,7 @@ function UsersContent() {
                     隧道限速
                   </Label>
                   <p className="text-xs text-muted-foreground">
-                    对 GOST 和自定义加密隧道生效；iptables、realm、socat 不受该限速影响。
+                    对 GOST 和自定义加密隧道生效；iptables、nftables、realm、socat 不受该限速影响。
                   </p>
                 </div>
                 <div className="space-y-2">

@@ -115,6 +115,56 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
       `iptables -F FWX_OUT_${port} 2>/dev/null || true`,
       `iptables -X FWX_OUT_${port} 2>/dev/null || true`,
     ];
+    const nftTable = "forwardx";
+    const nftChain = (prefix: string, id: number) => `${prefix}_${id}`;
+    const nftComment = (rule: any) => `fwx-rule-${Number(rule.id) || 0}`;
+    const buildNftCleanupCmds = (rule: any): string[] => {
+      const ruleId = Number(rule.id) || 0;
+      const comment = nftComment(rule);
+      return [
+        `nft list table inet ${nftTable} >/dev/null 2>&1 || exit 0; for h in $(nft -a list chain inet ${nftTable} prerouting 2>/dev/null | awk -v c='"${comment}"' '$0 ~ c {print $NF}'); do nft delete rule inet ${nftTable} prerouting handle "$h" 2>/dev/null || true; done`,
+        `nft list table inet ${nftTable} >/dev/null 2>&1 || exit 0; for h in $(nft -a list chain inet ${nftTable} postrouting 2>/dev/null | awk -v c='"${comment}"' '$0 ~ c {print $NF}'); do nft delete rule inet ${nftTable} postrouting handle "$h" 2>/dev/null || true; done`,
+        `nft list table inet ${nftTable} >/dev/null 2>&1 || exit 0; for h in $(nft -a list chain inet ${nftTable} forward 2>/dev/null | awk -v c='"${comment}"' '$0 ~ c {print $NF}'); do nft delete rule inet ${nftTable} forward handle "$h" 2>/dev/null || true; done`,
+        `nft flush chain inet ${nftTable} ${nftChain("in", ruleId)} 2>/dev/null || true`,
+        `nft delete chain inet ${nftTable} ${nftChain("in", ruleId)} 2>/dev/null || true`,
+        `nft flush chain inet ${nftTable} ${nftChain("out", ruleId)} 2>/dev/null || true`,
+        `nft delete chain inet ${nftTable} ${nftChain("out", ruleId)} 2>/dev/null || true`,
+        `rm -f /var/lib/forwardx-agent/traffic_${rule.sourcePort}.prev /var/lib/forwardx-agent/port_${rule.sourcePort}.rule /var/lib/forwardx-agent/port_${rule.sourcePort}.fwtype /var/lib/forwardx-agent/target_${rule.sourcePort}.info 2>/dev/null || true`,
+      ];
+    };
+    const buildNftForwardCmds = (rule: any): string[] => {
+      const protos = rule.protocol === "both" ? ["tcp", "udp"] : [rule.protocol === "udp" ? "udp" : "tcp"];
+      const ruleId = Number(rule.id) || 0;
+      const inCh = nftChain("in", ruleId);
+      const outCh = nftChain("out", ruleId);
+      const comment = nftComment(rule);
+      const cmds = [
+        `command -v nft >/dev/null 2>&1`,
+        `sysctl -w net.ipv4.ip_forward=1 >/dev/null`,
+        `nft add table inet ${nftTable} 2>/dev/null || true`,
+        `nft add chain inet ${nftTable} prerouting '{ type nat hook prerouting priority dstnat; policy accept; }' 2>/dev/null || true`,
+        `nft add chain inet ${nftTable} postrouting '{ type nat hook postrouting priority srcnat; policy accept; }' 2>/dev/null || true`,
+        `nft add chain inet ${nftTable} forward '{ type filter hook forward priority filter; policy accept; }' 2>/dev/null || true`,
+        ...buildNftCleanupCmds(rule),
+        `nft add table inet ${nftTable} 2>/dev/null || true`,
+        `nft add chain inet ${nftTable} prerouting '{ type nat hook prerouting priority dstnat; policy accept; }' 2>/dev/null || true`,
+        `nft add chain inet ${nftTable} postrouting '{ type nat hook postrouting priority srcnat; policy accept; }' 2>/dev/null || true`,
+        `nft add chain inet ${nftTable} forward '{ type filter hook forward priority filter; policy accept; }' 2>/dev/null || true`,
+        `nft add chain inet ${nftTable} ${inCh} 2>/dev/null || true`,
+        `nft add chain inet ${nftTable} ${outCh} 2>/dev/null || true`,
+        `nft add rule inet ${nftTable} ${inCh} counter return`,
+        `nft add rule inet ${nftTable} ${outCh} counter return`,
+      ];
+      for (const proto of protos) {
+        cmds.push(`nft add rule inet ${nftTable} prerouting ${proto} dport ${rule.sourcePort} counter jump ${inCh} comment "${comment}"`);
+        cmds.push(`nft add rule inet ${nftTable} postrouting ip protocol ${proto} ip daddr ${rule.targetIp} ${proto} dport ${rule.targetPort} counter jump ${outCh} comment "${comment}"`);
+        cmds.push(`nft add rule inet ${nftTable} prerouting ${proto} dport ${rule.sourcePort} dnat ip to ${rule.targetIp}:${rule.targetPort} comment "${comment}"`);
+        cmds.push(`nft add rule inet ${nftTable} postrouting ip protocol ${proto} ip daddr ${rule.targetIp} ${proto} dport ${rule.targetPort} masquerade comment "${comment}"`);
+        cmds.push(`nft add rule inet ${nftTable} forward ip protocol ${proto} ip daddr ${rule.targetIp} ${proto} dport ${rule.targetPort} accept comment "${comment}"`);
+        cmds.push(`nft add rule inet ${nftTable} forward ip protocol ${proto} ip saddr ${rule.targetIp} ${proto} sport ${rule.targetPort} ct state established,related accept comment "${comment}"`);
+      }
+      return cmds;
+    };
     const buildManagedPortCleanupCmds = (port: number): string[] => [
       `systemctl stop forwardx-socat-${port}.service forwardx-socat-tcp-${port}.service forwardx-socat-udp-${port}.service forwardx-realm-${port}.service 2>/dev/null || true`,
       `systemctl disable forwardx-socat-${port}.service forwardx-socat-tcp-${port}.service forwardx-socat-udp-${port}.service forwardx-realm-${port}.service 2>/dev/null || true`,
@@ -273,20 +323,6 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
         if (tunnel && isForwardXTunnel(tunnel)) return [];
         const protos = tunnel ? tunnelForwardProtos(r.protocol) : (r.protocol === "both" ? ["tcp", "udp"] : [r.protocol === "udp" ? "udp" : "tcp"]);
         return protos.map((proto) => {
-          if ((r as any).gostMode === "reverse") {
-            return applyGostLimiter({
-              name: `fwx-${r.id}-${proto}`,
-              addr: ":0",
-              handler: { type: proto === "udp" ? "rudp" : "rtcp" },
-              listener: { type: proto === "udp" ? "rudp" : "rtcp", chain: `chain-${r.id}-${proto}` },
-              forwarder: {
-                nodes: [{
-                  name: `target-${r.id}`,
-                  addr: `${r.targetIp}:${r.targetPort}`,
-                }],
-              },
-            }, Number(r.userId));
-          }
           const tunnelExitHost = tunnel ? tunnelExitHostById.get(tunnel.id) : "";
           const service: any = {
             name: `fwx-${r.id}-${proto}`,
@@ -310,29 +346,6 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
         });
       })
       .filter(Boolean);
-    const reverseGostChains = gostRules
-      .filter((r: any) => (r as any).gostMode === "reverse")
-      .flatMap((r: any) => {
-        const protos = r.protocol === "both" ? ["tcp", "udp"] : [r.protocol === "udp" ? "udp" : "tcp"];
-        return protos.map((proto) => {
-          const tunnelId = `00000000-0000-4000-8000-${String(r.id).padStart(12, "0").slice(-12)}`;
-          return {
-            name: `chain-${r.id}-${proto}`,
-            hops: [{
-              name: `hop-${r.id}-${proto}`,
-              nodes: [{
-                name: `relay-${r.id}-${proto}`,
-                addr: `${(r as any).gostRelayHost}:${(r as any).gostRelayPort}`,
-                connector: {
-                  type: "tunnel",
-                  metadata: { "tunnel.id": tunnelId },
-                },
-                dialer: { type: "tcp" },
-              }],
-            }],
-          };
-        });
-      });
     const tunnelGostChains = gostRules
       .filter((r: any) => r.isEnabled && r.forwardType === "gost" && r.tunnelId)
       .flatMap((r: any) => {
@@ -356,7 +369,7 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
           }],
         }];
       });
-    const gostChains = [...reverseGostChains, ...tunnelGostChains];
+    const gostChains = [...tunnelGostChains];
     const buildGostReloadCmds = () => {
       const encodedConfig = Buffer.from(JSON.stringify({ services: gostServiceConfig, chains: gostChains, limiters: gostRateLimiters }, null, 2), "utf8").toString("base64");
       return [
@@ -475,6 +488,20 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
         cmds.push(`rm -f /var/lib/forwardx-agent/traffic_${rule.sourcePort}.prev 2>/dev/null || true`);
         cmds.push(`rm -f /var/lib/forwardx-agent/port_${rule.sourcePort}.rule 2>/dev/null || true`);
         cmds.push(...buildCountingCleanupCmds(rule.sourcePort));
+        cmds.push(...buildAccessLimitCleanupCmds(rule.sourcePort, accessScopeForRule(rule)));
+        return {
+          ruleId: rule.id,
+          op: "remove",
+          forwardType: rule.forwardType,
+          sourcePort: rule.sourcePort,
+          targetIp: rule.targetIp,
+          targetPort: rule.targetPort,
+          protocol: rule.protocol,
+          commands: cmds,
+        };
+      }
+      if (rule.forwardType === "nftables") {
+        const cmds = buildNftCleanupCmds(rule);
         cmds.push(...buildAccessLimitCleanupCmds(rule.sourcePort, accessScopeForRule(rule)));
         return {
           ruleId: rule.id,
@@ -677,6 +704,20 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
           }
           // 挂入 mangle 计数链，为 Agent 采样提供准确流量计数器
           for (const c of buildCountingChainCmds(rule.sourcePort)) cmds.push(c);
+          for (const c of buildAccessLimitCmds(rule.sourcePort, accessScopeForRule(rule), userAccessLimits(Number(rule.userId)))) cmds.push(c);
+          actions.push({
+            ruleId: rule.id,
+            op: "apply",
+            forwardType: rule.forwardType,
+            sourcePort: rule.sourcePort,
+            targetIp: rule.targetIp,
+            targetPort: rule.targetPort,
+            protocol: rule.protocol,
+            networkInterface: hostInterface,
+            commands: cmds,
+          });
+        } else if (rule.forwardType === "nftables") {
+          cmds.push(...buildNftForwardCmds(rule));
           for (const c of buildAccessLimitCmds(rule.sourcePort, accessScopeForRule(rule), userAccessLimits(Number(rule.userId)))) cmds.push(c);
           actions.push({
             ruleId: rule.id,
