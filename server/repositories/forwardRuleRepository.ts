@@ -1,5 +1,5 @@
 ﻿import { and, desc, eq, sql } from "drizzle-orm";
-import { forwardRules, InsertForwardRule, trafficStats } from "../../drizzle/schema";
+import { forwardGroupMembers, forwardRules, InsertForwardRule, trafficStats } from "../../drizzle/schema";
 import { getDb, insertAndGetId, nowDate } from "../dbRuntime";
 
 // ==================== Forward Rule Queries ====================
@@ -7,7 +7,11 @@ import { getDb, insertAndGetId, nowDate } from "../dbRuntime";
 export async function getForwardRules(userId?: number, hostId?: number) {
   const db = await getDb();
   if (!db) return [];
-  const conds: any[] = [eq(forwardRules.pendingDelete, false)];
+  const conds: any[] = [
+    eq(forwardRules.pendingDelete, false),
+    sql`${forwardRules.forwardGroupRuleId} IS NULL`,
+    sql`${forwardRules.id} NOT IN (SELECT ${forwardGroupMembers.ruleId} FROM ${forwardGroupMembers} WHERE ${forwardGroupMembers.ruleId} IS NOT NULL)`,
+  ];
   if (userId) conds.push(eq(forwardRules.userId, userId));
   if (hostId) conds.push(eq(forwardRules.hostId, hostId));
   return db.select().from(forwardRules).where(and(...conds)).orderBy(desc(forwardRules.createdAt));
@@ -16,10 +20,14 @@ export async function getForwardRules(userId?: number, hostId?: number) {
 export async function getForwardRulesForAgent(hostId?: number) {
   const db = await getDb();
   if (!db) return [];
+  const conds: any[] = [
+    sql`NOT (${forwardRules.isForwardGroupTemplate} = ${true})`,
+  ];
   if (hostId) {
-    return db.select().from(forwardRules).where(eq(forwardRules.hostId, hostId)).orderBy(desc(forwardRules.createdAt));
+    conds.push(eq(forwardRules.hostId, hostId));
+    return db.select().from(forwardRules).where(and(...conds)).orderBy(desc(forwardRules.createdAt));
   }
-  return db.select().from(forwardRules).orderBy(desc(forwardRules.createdAt));
+  return db.select().from(forwardRules).where(and(...conds)).orderBy(desc(forwardRules.createdAt));
 }
 
 export async function getForwardRuleById(id: number) {
@@ -33,6 +41,56 @@ export async function getForwardRulesByTunnel(tunnelId: number) {
   const db = await getDb();
   if (!db) return [];
   return db.select().from(forwardRules).where(eq(forwardRules.tunnelId, tunnelId)).orderBy(desc(forwardRules.createdAt));
+}
+
+export async function getForwardGroupTemplateRules(groupId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(forwardRules)
+    .where(and(
+      eq(forwardRules.forwardGroupId, groupId),
+      eq(forwardRules.isForwardGroupTemplate, true),
+      eq(forwardRules.pendingDelete, false),
+    ))
+    .orderBy(desc(forwardRules.createdAt));
+}
+
+export async function getForwardGroupChildRules(groupId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(forwardRules)
+    .where(and(
+      eq(forwardRules.forwardGroupId, groupId),
+      sql`${forwardRules.forwardGroupRuleId} IS NOT NULL`,
+    ))
+    .orderBy(desc(forwardRules.createdAt));
+}
+
+export async function getForwardGroupChildRulesForTemplate(templateRuleId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(forwardRules)
+    .where(eq(forwardRules.forwardGroupRuleId, templateRuleId))
+    .orderBy(desc(forwardRules.createdAt));
+}
+
+export async function getForwardGroupChildRulesForMember(memberId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(forwardRules)
+    .where(and(
+      eq(forwardRules.forwardGroupMemberId, memberId),
+      eq(forwardRules.pendingDelete, false),
+    ))
+    .orderBy(desc(forwardRules.createdAt));
 }
 
 export async function createForwardRule(rule: InsertForwardRule) {

@@ -1,7 +1,6 @@
 import { z } from "zod";
 import { adminProcedure, router } from "../_core/trpc";
 import * as db from "../db";
-import { forwardTypeSchema } from "./schemas";
 
 const memberSchema = z.object({
   memberType: z.enum(["host", "tunnel"]),
@@ -14,13 +13,8 @@ const memberSchema = z.object({
 const baseSchema = z.object({
   name: z.string().min(1).max(128),
   groupType: z.enum(["host", "tunnel"]),
-  forwardType: forwardTypeSchema.default("iptables"),
   domain: z.string().max(255).nullable().optional(),
   recordType: z.enum(["A", "AAAA", "CNAME"]).default("A"),
-  sourcePort: z.number().int().min(1).max(65535),
-  protocol: z.enum(["tcp", "udp", "both"]).default("tcp"),
-  targetIp: z.string().min(1).max(128),
-  targetPort: z.number().int().min(1).max(65535),
   failoverSeconds: z.number().int().min(10).max(3600).default(60),
   recoverSeconds: z.number().int().min(10).max(3600).default(120),
   autoFailback: z.boolean().default(true),
@@ -65,13 +59,13 @@ export const forwardGroupsRouter = router({
       const id = await db.createForwardGroup({
         name: input.name,
         groupType: input.groupType,
-        forwardType: input.groupType === "tunnel" ? "gost" : input.forwardType,
+        forwardType: input.groupType === "tunnel" ? "gost" : "iptables",
         domain: input.domain?.trim() || null,
         recordType: input.recordType,
-        sourcePort: input.sourcePort,
-        protocol: input.protocol,
-        targetIp: input.targetIp.trim(),
-        targetPort: input.targetPort,
+        sourcePort: 1,
+        protocol: "both",
+        targetIp: "0.0.0.0",
+        targetPort: 1,
         failoverSeconds: input.failoverSeconds,
         recoverSeconds: input.recoverSeconds,
         autoFailback: input.autoFailback,
@@ -88,13 +82,9 @@ export const forwardGroupsRouter = router({
       await db.updateForwardGroup(input.id, {
         name: input.name,
         groupType: input.groupType,
-        forwardType: input.groupType === "tunnel" ? "gost" : input.forwardType,
+        forwardType: input.groupType === "tunnel" ? "gost" : "iptables",
         domain: input.domain?.trim() || null,
         recordType: input.recordType,
-        sourcePort: input.sourcePort,
-        protocol: input.protocol,
-        targetIp: input.targetIp.trim(),
-        targetPort: input.targetPort,
         failoverSeconds: input.failoverSeconds,
         recoverSeconds: input.recoverSeconds,
         autoFailback: input.autoFailback,

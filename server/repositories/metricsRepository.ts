@@ -107,6 +107,40 @@ export async function getTrafficSummaryByRule(opts: {
     connections: Number(r.connections) || 0,
   }));
 
+  const groupChildIds = Array.from(new Set(result.map((r) => r.ruleId)));
+  if (groupChildIds.length > 0) {
+    const childRows = await db
+      .select({
+        id: forwardRules.id,
+        parentId: forwardRules.forwardGroupRuleId,
+        hostId: forwardRules.hostId,
+      })
+      .from(forwardRules)
+      .where(sql`${forwardRules.id} IN (${sql.join(groupChildIds.map(id => sql`${id}`), sql`, `)}) AND ${forwardRules.forwardGroupRuleId} IS NOT NULL`);
+    const parentByChild = new Map<number, { parentId: number; hostId: number }>();
+    for (const row of childRows as any[]) {
+      parentByChild.set(Number(row.id), { parentId: Number(row.parentId), hostId: Number(row.hostId) });
+    }
+    if (parentByChild.size > 0) {
+      const merged = new Map<string, { ruleId: number; hostId: number; bytesIn: number; bytesOut: number; connections: number }>();
+      for (const item of result) {
+        const parent = parentByChild.get(item.ruleId);
+        const ruleId = parent?.parentId || item.ruleId;
+        const hostId = parent?.hostId || item.hostId;
+        const key = `${ruleId}:${hostId}`;
+        const prev = merged.get(key);
+        if (prev) {
+          prev.bytesIn += item.bytesIn;
+          prev.bytesOut += item.bytesOut;
+          prev.connections += item.connections;
+        } else {
+          merged.set(key, { ...item, ruleId, hostId });
+        }
+      }
+      result = Array.from(merged.values());
+    }
+  }
+
   if (opts.userId) {
     const ruleIds = await getRuleIdsByUser(opts.userId);
     const ok = new Set(ruleIds);

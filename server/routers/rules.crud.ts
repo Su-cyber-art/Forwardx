@@ -9,7 +9,7 @@ import { requireRuleProtocolEnabled } from "../forwardProtocolSettings";
 export const crudRulesRouter = router({
   create: protectedProcedure
     .input(z.object({
-      hostId: z.number(),
+      hostId: z.number().optional(),
       name: z.string().min(1).max(128),
       forwardType: forwardTypeSchema.default("iptables"),
       protocol: z.enum(["tcp", "udp", "both"]).default("both"),
@@ -17,6 +17,7 @@ export const crudRulesRouter = router({
       gostRelayHost: z.string().max(128).nullable().optional(),
       gostRelayPort: z.number().min(1).max(65535).nullable().optional(),
       tunnelId: z.number().nullable().optional(),
+      forwardGroupId: z.number().nullable().optional(),
       sourcePort: z.number().min(0).max(65535), // 0 = 随机分配
       targetIp: z.string().min(1).max(64),
       targetPort: z.number().min(1).max(65535),
@@ -55,6 +56,46 @@ export const crudRulesRouter = router({
         }
       }
 
+      if (input.forwardGroupId) {
+        if (ctx.user.role !== "admin") throw new Error("只有管理员可以使用转发组");
+        if (input.sourcePort === 0) throw new Error("转发组规则需要指定固定入口端口");
+        const sourcePort = input.sourcePort;
+        const group = await db.validateForwardGroupRuleConfig(input.forwardGroupId, { sourcePort });
+        const hostId = await db.getForwardGroupDefaultHostId(input.forwardGroupId);
+        const forwardType = (group as any).groupType === "tunnel" ? "gost" : input.forwardType;
+        if (ctx.user.role !== "admin") {
+          const allowedRaw = (ctx.user as any).allowedForwardTypes as string | null | undefined;
+          if (allowedRaw !== null && allowedRaw !== undefined) {
+            const allowed = new Set(allowedRaw.split(",").map(s => s.trim()).filter(Boolean));
+            if (!allowed.has(forwardType)) throw new Error(`鎮ㄦ病鏈変娇鐢?${forwardType} 杞彂鏂瑰紡鐨勬潈闄愶紝璇疯仈绯荤鐞嗗憳`);
+          }
+        }
+        await requireRuleProtocolEnabled({ forwardType, tunnelId: null });
+        const id = await db.createForwardRule({
+          hostId,
+          name: input.name,
+          forwardType,
+          protocol: input.protocol,
+          gostMode: "direct",
+          gostRelayHost: null,
+          gostRelayPort: null,
+          tunnelId: null,
+          tunnelExitPort: null,
+          forwardGroupId: input.forwardGroupId,
+          forwardGroupRuleId: null,
+          forwardGroupMemberId: null,
+          isForwardGroupTemplate: true,
+          sourcePort,
+          targetIp: input.targetIp.trim(),
+          targetPort: input.targetPort,
+          isRunning: false,
+          userId: ctx.user.id,
+        } as any);
+        await db.syncForwardGroupRules(input.forwardGroupId);
+        return { id, sourcePort };
+      }
+
+      if (!input.hostId) throw new Error("请选择所属主机");
       const tunnelId = input.forwardType === "gost" ? input.tunnelId ?? null : null;
       let selectedTunnelForRule: any = null;
       let isTrafficBillingRule = false;
@@ -147,6 +188,7 @@ export const crudRulesRouter = router({
       gostRelayPort: z.number().min(1).max(65535).nullable().optional(),
       tunnelId: z.number().nullable().optional(),
       tunnelExitPort: z.number().min(1).max(65535).nullable().optional(),
+      forwardGroupId: z.number().nullable().optional(),
       sourcePort: z.number().min(1).max(65535).optional(),
       targetIp: z.string().min(1).max(64).optional(),
       targetPort: z.number().min(1).max(65535).optional(),
@@ -156,6 +198,40 @@ export const crudRulesRouter = router({
       const rule = await db.getForwardRuleById(input.id);
       if (!rule) throw new Error("规则不存在");
       if (ctx.user.role !== "admin" && rule.userId !== ctx.user.id) throw new Error("无权操作此规则");
+      if ((rule as any).forwardGroupRuleId) throw new Error("转发组成员规则由系统维护，不能直接修改");
+
+      if ((rule as any).isForwardGroupTemplate) {
+        if (ctx.user.role !== "admin") throw new Error("只有管理员可以修改转发组规则");
+        const groupId = Number((rule as any).forwardGroupId || 0);
+        if (!groupId) throw new Error("转发组不存在");
+        const group = await db.validateForwardGroupRuleConfig(groupId, {
+          sourcePort: input.sourcePort ?? rule.sourcePort,
+          excludeTemplateRuleId: rule.id,
+        });
+        const nextForwardType = (group as any).groupType === "tunnel" ? "gost" : (input.forwardType ?? rule.forwardType);
+        await requireRuleProtocolEnabled({ ...rule, forwardType: nextForwardType, tunnelId: null });
+        const data: any = {
+          ...input,
+          forwardType: nextForwardType,
+          gostMode: "direct",
+          gostRelayHost: null,
+          gostRelayPort: null,
+          tunnelId: null,
+          tunnelExitPort: null,
+          forwardGroupId: groupId,
+          forwardGroupRuleId: null,
+          forwardGroupMemberId: null,
+          isForwardGroupTemplate: true,
+        };
+        delete data.id;
+        const watchedFields = ["sourcePort", "targetIp", "targetPort", "forwardType", "protocol"] as const;
+        const keyFieldChanged = watchedFields.some((field) => data[field] !== undefined && data[field] !== (rule as any)[field]);
+        if (keyFieldChanged || data.isEnabled !== undefined) data.isRunning = false;
+        await db.updateForwardRule(input.id, data);
+        await db.syncForwardGroupRules(groupId);
+        return { success: true, reset: keyFieldChanged };
+      }
+
       await requireRuleProtocolEnabled(rule);
 
       // 如果修改了源端口，检查端口区间和占用
@@ -278,6 +354,21 @@ export const crudRulesRouter = router({
       const rule = await db.getForwardRuleById(input.id);
       if (!rule) throw new Error("规则不存在");
       if (ctx.user.role !== "admin" && rule.userId !== ctx.user.id) throw new Error("无权操作此规则");
+      if ((rule as any).forwardGroupRuleId) throw new Error("转发组成员规则由系统维护，不能直接删除");
+      if ((rule as any).isForwardGroupTemplate) {
+        const childRules = await db.getForwardGroupChildRulesForTemplate(input.id);
+        for (const child of childRules as any[]) {
+          if ((child as any).tunnelId) {
+            const tunnel = await db.getTunnelById((child as any).tunnelId);
+            await db.updateTunnel((child as any).tunnelId, { isRunning: false } as any);
+            if (tunnel) pushTunnelEndpointRefresh(tunnel, "forward-group-rule-deleted");
+          }
+          await db.markForwardRulePendingDelete(Number(child.id));
+          pushAgentRefresh(Number(child.hostId), "forward-group-rule-deleted");
+        }
+        await db.markForwardRulePendingDelete(input.id);
+        return { success: true };
+      }
       if ((rule as any).tunnelId) {
         const tunnel = await db.getTunnelById((rule as any).tunnelId);
         await db.updateTunnel((rule as any).tunnelId, { isRunning: false } as any);
@@ -293,6 +384,16 @@ export const crudRulesRouter = router({
       const rule = await db.getForwardRuleById(input.id);
       if (!rule) throw new Error("规则不存在");
       if (ctx.user.role !== "admin" && rule.userId !== ctx.user.id) throw new Error("无权操作此规则");
+      if ((rule as any).forwardGroupRuleId) throw new Error("转发组成员规则由系统维护，不能直接开关");
+      if ((rule as any).isForwardGroupTemplate) {
+        if (input.isEnabled) {
+          await db.updateForwardRule(input.id, { isEnabled: true, isRunning: false, protocolBlockReason: null } as any);
+        } else {
+          await db.toggleForwardRule(input.id, false);
+        }
+        await db.syncForwardGroupRules(Number((rule as any).forwardGroupId));
+        return { success: true };
+      }
       await requireRuleProtocolEnabled(rule);
       if ((rule as any).tunnelId) {
         const tunnel = await db.getTunnelById((rule as any).tunnelId);

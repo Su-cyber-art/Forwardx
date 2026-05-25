@@ -53,6 +53,7 @@ import {
   Copy,
   Network,
   ClipboardCopy,
+  Layers3,
 } from "lucide-react";
 import {
   FORWARD_TYPES,
@@ -81,13 +82,14 @@ function formatBytes(n: number): string {
 type RuleFormData = {
   hostId: number | null;
   name: string;
-  routeMode: "local" | "tunnel";
+  routeMode: "local" | "tunnel" | "group";
   forwardType: ForwardType;
   protocol: "tcp" | "udp" | "both";
   gostMode: "direct" | "reverse";
   gostRelayHost: string;
   gostRelayPort: number;
   tunnelId: number | null;
+  forwardGroupId: number | null;
   sourcePort: number;
   targetIp: string;
   targetPort: number;
@@ -103,6 +105,7 @@ const defaultForm: RuleFormData = {
   gostRelayHost: "",
   gostRelayPort: 0,
   tunnelId: null,
+  forwardGroupId: null,
   sourcePort: 0,
   targetIp: "",
   targetPort: 0,
@@ -154,6 +157,10 @@ function RulesContent() {
   });
   const { data: hosts } = trpc.hosts.list.useQuery();
   const { data: tunnels } = trpc.tunnels.list.useQuery();
+  const { data: forwardGroups } = trpc.forwardGroups.list.useQuery(undefined, {
+    enabled: user?.role === "admin",
+    refetchInterval: 15000,
+  });
   const { data: systemSettings } = trpc.system.getSettings.useQuery();
 
   const [showDialog, setShowDialog] = useState(false);
@@ -253,11 +260,18 @@ function RulesContent() {
   const [trafficDetailRule, setTrafficDetailRule] = useState<{ id: number; name: string } | null>(null);
   const [selfTestRule, setSelfTestRule] = useState<{ id: number; name: string } | null>(null);
 
-  const setRouteMode = (mode: "local" | "tunnel") => {
+  const setRouteMode = (mode: "local" | "tunnel" | "group") => {
+    if (editingId && mode !== form.routeMode) return;
     if (mode === "local" && !canUseLocalForward) return;
     if (mode === "tunnel" && !canUseGost) return;
     if (mode === "tunnel" && availableTunnels.length === 0) return;
+    if (mode === "group" && availableForwardGroups.length === 0) return;
+    const nextGroup = mode === "group"
+      ? (selectedForwardGroup || availableForwardGroups[0])
+      : null;
     const nextForwardType = mode === "tunnel"
+      ? "gost"
+      : mode === "group" && nextGroup?.groupType === "tunnel"
       ? "gost"
       : (usableForwardTypes.includes(form.forwardType) ? form.forwardType : usableForwardTypes[0]);
     if (!nextForwardType) return;
@@ -266,7 +280,8 @@ function RulesContent() {
       routeMode: mode,
       forwardType: nextForwardType,
       tunnelId: mode === "tunnel" ? prev.tunnelId : null,
-      hostId: mode === "tunnel" && selectedTunnel ? selectedTunnel.entryHostId : prev.hostId,
+      forwardGroupId: mode === "group" && nextGroup ? Number(nextGroup.id) : null,
+      hostId: mode === "tunnel" && selectedTunnel ? selectedTunnel.entryHostId : mode === "group" ? null : prev.hostId,
     }));
   };
 
@@ -289,13 +304,15 @@ function RulesContent() {
     const firstTunnel = canUseGost
       ? supportedTunnels[0]
       : null;
-    if (hosts && hosts.length > 0) {
+    const firstGroup = availableForwardGroups[0];
+    if ((hosts && hosts.length > 0) || firstGroup) {
       setForm({
         ...defaultForm,
-        routeMode: firstForwardType ? "local" : firstTunnel ? "tunnel" : "local",
-        hostId: firstForwardType ? hosts[0].id : firstTunnel ? firstTunnel.entryHostId : hosts[0].id,
-        forwardType: firstForwardType ?? "gost",
+        routeMode: firstForwardType && hosts?.[0] ? "local" : firstTunnel ? "tunnel" : firstGroup ? "group" : "local",
+        hostId: firstForwardType && hosts?.[0] ? hosts[0].id : firstTunnel ? firstTunnel.entryHostId : null,
+        forwardType: firstTunnel && !firstForwardType ? "gost" : firstGroup?.groupType === "tunnel" ? "gost" : firstForwardType ?? "iptables",
         tunnelId: firstTunnel && !firstForwardType ? firstTunnel.id : null,
+        forwardGroupId: !firstForwardType && !firstTunnel && firstGroup ? Number(firstGroup.id) : null,
       });
     }
     setShowDialog(true);
@@ -321,13 +338,14 @@ function RulesContent() {
     setForm({
       hostId: rule.hostId,
       name: rule.name,
-      routeMode: rule.forwardType === "gost" && rule.tunnelId ? "tunnel" : "local",
+      routeMode: rule.forwardGroupId ? "group" : rule.forwardType === "gost" && rule.tunnelId ? "tunnel" : "local",
       forwardType: rule.forwardType,
       protocol: rule.protocol,
       gostMode: "direct",
       gostRelayHost: "",
       gostRelayPort: 0,
       tunnelId: rule.tunnelId || null,
+      forwardGroupId: rule.forwardGroupId || null,
       sourcePort: rule.sourcePort,
       targetIp: rule.targetIp,
       targetPort: rule.targetPort,
@@ -351,9 +369,10 @@ function RulesContent() {
 
   // 获取当前选中主机的端口区间
   const selectedHost = useMemo(() => {
+    if (form.routeMode === "group") return null;
     if (!form.hostId || !hosts) return null;
-    return hosts.find(h => h.id === form.hostId) || null;
-  }, [form.hostId, hosts]);
+    return hosts.find((h: any) => h.id === form.hostId) || null;
+  }, [form.hostId, form.routeMode, hosts]);
   const forwardProtocolSettings = useMemo(
     () => normalizeForwardProtocolSettings(systemSettings?.forwardProtocols),
     [systemSettings?.forwardProtocols]
@@ -395,6 +414,19 @@ function RulesContent() {
     (tunnels || []).forEach((t: any) => map.set(Number(t.id), getTunnelDisplay(t)));
     return map;
   }, [tunnels]);
+  const forwardGroupById = useMemo(() => {
+    const map = new Map<number, any>();
+    (forwardGroups || []).forEach((group: any) => map.set(Number(group.id), group));
+    return map;
+  }, [forwardGroups]);
+  const availableForwardGroups = useMemo(
+    () => (forwardGroups || []).filter((group: any) => group.isEnabled && (group.members || []).length > 0),
+    [forwardGroups]
+  );
+  const selectedForwardGroup = useMemo(() => {
+    if (!form.forwardGroupId) return null;
+    return forwardGroupById.get(Number(form.forwardGroupId)) || null;
+  }, [form.forwardGroupId, forwardGroupById]);
   /**
    * 当前用户被允许使用的转发方式。
    * - 管理员：不受限制（返回全部）
@@ -415,8 +447,9 @@ function RulesContent() {
   );
   const canUseLocalForward = usableForwardTypes.length > 0;
   const canUseGost = allowedForwardTypes.includes("gost") && supportedTunnels.length > 0;
+  const canUseForwardGroup = user?.role === "admin" && availableForwardGroups.length > 0;
   const activeCount = useMemo(
-    () => rules?.filter((r) => r.isEnabled && isRuleSupported(r)).length ?? 0,
+    () => rules?.filter((r: any) => r.isEnabled && isRuleSupported(r)).length ?? 0,
     [isRuleSupported, rules]
   );
   const copyableSourceRules = useMemo(() => {
@@ -431,6 +464,11 @@ function RulesContent() {
   const [portRangeError, setPortRangeError] = useState<string | null>(null);
 
   const checkPort = useCallback(async () => {
+    if (form.routeMode === "group") {
+      setPortStatus("idle");
+      setPortRangeError(null);
+      return;
+    }
     if (!form.hostId || !form.sourcePort || form.sourcePort < 1) return;
     if (!isValidPort(form.sourcePort)) {
       setPortRangeError("端口必须在 1-65535 之间");
@@ -464,13 +502,17 @@ function RulesContent() {
 
   // 源端口变化时自动检测
   useEffect(() => {
+    if (form.routeMode === "group") {
+      setPortStatus("idle");
+      return;
+    }
     if (form.sourcePort > 0 && form.hostId) {
       const timer = setTimeout(checkPort, 500);
       return () => clearTimeout(timer);
     } else {
       setPortStatus("idle");
     }
-  }, [form.sourcePort, form.hostId, checkPort]);
+  }, [form.sourcePort, form.hostId, form.routeMode, checkPort]);
 
   useEffect(() => {
     if (form.routeMode !== "local") return;
@@ -480,8 +522,23 @@ function RulesContent() {
     }
   }, [form.forwardType, form.routeMode, usableForwardTypes]);
 
+  useEffect(() => {
+    if (form.routeMode !== "group") return;
+    if (!selectedForwardGroup && availableForwardGroups.length > 0) {
+      setForm((prev) => ({ ...prev, forwardGroupId: Number(availableForwardGroups[0].id) }));
+      return;
+    }
+    if (selectedForwardGroup?.groupType === "tunnel" && form.forwardType !== "gost") {
+      setForm((prev) => ({ ...prev, forwardType: "gost" }));
+    }
+  }, [availableForwardGroups, form.forwardType, form.routeMode, selectedForwardGroup]);
+
   // 随机分配端口
   const handleRandomPort = async () => {
+    if (form.routeMode === "group") {
+      toast.error("转发组规则需要指定固定入口端口");
+      return;
+    }
     if (!form.hostId) {
       toast.error("请先选择主机");
       return;
@@ -521,8 +578,16 @@ function RulesContent() {
   };
 
   const handleSubmit = () => {
-    if (!form.hostId || !form.name || !form.targetIp || !form.targetPort) {
+    if (!form.name || !form.targetIp || !form.targetPort || (form.routeMode !== "group" && !form.hostId)) {
       toast.error("请填写所有必填字段（目标端口必须填写）");
+      return;
+    }
+    if (form.routeMode === "group" && !form.forwardGroupId) {
+      toast.error("请选择转发组");
+      return;
+    }
+    if (form.routeMode === "group" && !canUseForwardGroup) {
+      toast.error("暂无可用转发组");
       return;
     }
     if (form.routeMode === "tunnel" && !canUseGost) {
@@ -541,15 +606,19 @@ function RulesContent() {
       toast.error(unsupportedProtocolTitle);
       return;
     }
-    if (!isValidPort(form.sourcePort, !editingId)) {
-      toast.error(editingId ? "入口端口必须在 1-65535 之间" : "入口端口必须为 0 或 1-65535，0 表示随机分配");
+    if (form.routeMode === "group" && selectedForwardGroup?.groupType === "tunnel" && !isProtocolEnabled("gost")) {
+      toast.error(unsupportedProtocolTitle);
+      return;
+    }
+    if (!isValidPort(form.sourcePort, form.routeMode !== "group" && !editingId)) {
+      toast.error(form.routeMode === "group" || editingId ? "入口端口必须在 1-65535 之间" : "入口端口必须为 0 或 1-65535，0 表示随机分配");
       return;
     }
     if (!isValidPort(form.targetPort)) {
       toast.error("目标端口必须在 1-65535 之间");
       return;
     }
-    if (portStatus === "used") {
+    if (form.routeMode !== "group" && portStatus === "used") {
       toast.error("源端口已被占用，请更换端口或使用随机分配");
       return;
     }
@@ -557,26 +626,28 @@ function RulesContent() {
       updateMutation.mutate({
         id: editingId,
         name: form.name,
-        forwardType: form.routeMode === "tunnel" ? "gost" : form.forwardType,
+        forwardType: form.routeMode === "tunnel" || selectedForwardGroup?.groupType === "tunnel" ? "gost" : form.forwardType,
         protocol: form.protocol,
         gostMode: "direct",
         gostRelayHost: null,
         gostRelayPort: null,
         tunnelId: form.routeMode === "tunnel" ? form.tunnelId : null,
+        forwardGroupId: form.routeMode === "group" ? form.forwardGroupId : null,
         sourcePort: form.sourcePort,
         targetIp: form.targetIp,
         targetPort: form.targetPort,
       });
     } else {
       createMutation.mutate({
-        hostId: form.hostId!,
+        hostId: form.routeMode === "group" ? undefined : form.hostId!,
         name: form.name,
-        forwardType: form.routeMode === "tunnel" ? "gost" : form.forwardType,
+        forwardType: form.routeMode === "tunnel" || selectedForwardGroup?.groupType === "tunnel" ? "gost" : form.forwardType,
         protocol: form.protocol,
         gostMode: "direct",
         gostRelayHost: null,
         gostRelayPort: null,
         tunnelId: form.routeMode === "tunnel" ? form.tunnelId : null,
+        forwardGroupId: form.routeMode === "group" ? form.forwardGroupId : null,
         sourcePort: form.sourcePort,
         targetIp: form.targetIp,
         targetPort: form.targetPort,
@@ -588,26 +659,56 @@ function RulesContent() {
 
   const filteredRules = useMemo(() => {
     if (!rules) return [];
-    return rules.filter((r) => {
-      if (filterHost !== "all" && r.hostId !== parseInt(filterHost)) return false;
-      if (filterType !== "all" && r.forwardType !== filterType) return false;
+    return rules.filter((r: any) => {
+      if (filterHost !== "all") {
+        if (String(filterHost).startsWith("group:")) {
+          if (Number(r.forwardGroupId || 0) !== Number(String(filterHost).slice(6))) return false;
+        } else if (r.forwardGroupId || r.hostId !== parseInt(filterHost)) {
+          return false;
+        }
+      }
+      if (filterType !== "all") {
+        if (filterType === "forward-group") {
+          if (!r.forwardGroupId) return false;
+        } else if (r.forwardType !== filterType) return false;
+      }
       return true;
     });
   }, [rules, filterHost, filterType]);
 
   const getHostName = (hostId: number) => {
-    return hosts?.find((h) => h.id === hostId)?.name || `主机 #${hostId}`;
+    return hosts?.find((h: any) => h.id === hostId)?.name || `主机 #${hostId}`;
   };
 
   /** 获取主机的入口地址：优先用用户自定义的 entryIp，未填则回退 ip */
+  const getForwardGroupName = (groupId: number) => {
+    return forwardGroupById.get(Number(groupId))?.name || `转发组 #${groupId}`;
+  };
+
   const getHostEntry = (hostId: number): string => {
-    const h: any = hosts?.find((x) => x.id === hostId);
+    const h: any = hosts?.find((x: any) => x.id === hostId);
     if (!h) return "";
     return (h.entryIp && String(h.entryIp).trim()) || h.ip || "";
   };
 
   /** 复制入口 IP:端口 到剪贴板 */
   const copyEntryAddress = async (rule: any) => {
+    if (rule.forwardGroupId) {
+      const group = forwardGroupById.get(Number(rule.forwardGroupId));
+      const domain = String(group?.domain || "").trim();
+      if (!domain) {
+        toast.error("该转发组未配置 DDNS 域名");
+        return;
+      }
+      const text = `${domain}:${rule.sourcePort}`;
+      try {
+        await navigator.clipboard.writeText(text);
+        toast.success(`已复制入口地址: ${text}`);
+      } catch {
+        toast.error("复制失败，请手动复制");
+      }
+      return;
+    }
     const entry = getHostEntry(rule.hostId);
     if (!entry) {
       toast.error("未获取到主机入口地址");
@@ -635,6 +736,15 @@ function RulesContent() {
   };
 
   const renderStatusDot = (rule: any) => {
+    if (rule.forwardGroupId) {
+      const group = forwardGroupById.get(Number(rule.forwardGroupId));
+      if (group?.lastStatus === "healthy") {
+        return <span className="h-2.5 w-2.5 rounded-full bg-chart-2 shadow-sm shadow-chart-2/50 animate-pulse" />;
+      }
+      if (group?.lastStatus === "down" || group?.lastStatus === "error") {
+        return <span className="h-2.5 w-2.5 rounded-full bg-destructive/70 shadow-sm shadow-destructive/40" />;
+      }
+    }
     if (rule.isRunning) {
       return <span className="h-2.5 w-2.5 rounded-full bg-chart-2 shadow-sm shadow-chart-2/50 animate-pulse" />;
     }
@@ -652,9 +762,13 @@ function RulesContent() {
         className={`group inline-flex min-w-0 items-center gap-1 rounded bg-muted/40 px-1.5 py-0.5 transition-colors hover:bg-muted/70 ${
           compact ? "max-w-full" : "max-w-[240px]"
         }`}
-        title={`复制入口地址: ${getHostEntry(rule.hostId)}:${rule.sourcePort}`}
+        title={rule.forwardGroupId ? `复制转发组入口: ${(forwardGroupById.get(Number(rule.forwardGroupId))?.domain || getForwardGroupName(rule.forwardGroupId))}:${rule.sourcePort}` : `复制入口地址: ${getHostEntry(rule.hostId)}:${rule.sourcePort}`}
       >
-        <code className="truncate">{getHostEntry(rule.hostId) || getHostName(rule.hostId)}:{rule.sourcePort}</code>
+        <code className="truncate">
+          {rule.forwardGroupId
+            ? (forwardGroupById.get(Number(rule.forwardGroupId))?.domain || getForwardGroupName(rule.forwardGroupId))
+            : (getHostEntry(rule.hostId) || getHostName(rule.hostId))}:{rule.sourcePort}
+        </code>
         <Copy className="h-3 w-3 flex-shrink-0 text-muted-foreground opacity-60 group-hover:opacity-100" />
       </button>
       <ArrowRight className="h-3 w-3 flex-shrink-0 text-muted-foreground" />
@@ -668,7 +782,9 @@ function RulesContent() {
     <Badge
       variant="outline"
       className={`whitespace-nowrap text-[10px] ${
-        rule.forwardType === "iptables" || rule.forwardType === "nftables"
+        rule.forwardGroupId
+          ? "border-emerald-500/30 text-emerald-600"
+          : rule.forwardType === "iptables" || rule.forwardType === "nftables"
           ? "border-primary/30 text-primary"
           : rule.forwardType === "socat"
           ? "border-chart-5/30 text-chart-5"
@@ -677,7 +793,9 @@ function RulesContent() {
           : "border-chart-3/30 text-chart-3"
       }`}
     >
-      {rule.forwardType === "gost" && rule.tunnelId ? (
+      {rule.forwardGroupId ? (
+        <><Layers3 className="h-3 w-3 mr-1" />转发组</>
+      ) : rule.forwardType === "gost" && rule.tunnelId ? (
         <><Network className="h-3 w-3 mr-1" />{tunnelDisplayById.get(Number(rule.tunnelId))?.badgeLabel || "隧道"}</>
       ) : rule.forwardType === "iptables" ? (
         <><Shield className="h-3 w-3 mr-1" />iptables</>
@@ -837,9 +955,18 @@ function RulesContent() {
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="all">所有主机</SelectItem>
-              {hosts?.map((h) => (
+              {hosts?.map((h: any) => (
                 <SelectItem key={h.id} value={String(h.id)}>{h.name}</SelectItem>
               ))}
+              {forwardGroups && forwardGroups.length > 0 && (
+                <>
+                  {(forwardGroups || []).map((group: any) => (
+                    <SelectItem key={`group-${group.id}`} value={`group:${group.id}`}>
+                      转发组 / {group.name}
+                    </SelectItem>
+                  ))}
+                </>
+              )}
             </SelectContent>
           </Select>
           <Select value={filterType} onValueChange={setFilterType}>
@@ -853,6 +980,7 @@ function RulesContent() {
               <SelectItem value="realm">realm</SelectItem>
               <SelectItem value="socat">socat</SelectItem>
               <SelectItem value="gost">gost</SelectItem>
+              <SelectItem value="forward-group">转发组</SelectItem>
             </SelectContent>
           </Select>
         </div>
@@ -900,7 +1028,7 @@ function RulesContent() {
           ) : filteredRules.length > 0 ? (
             <>
               <div className="grid gap-3 p-3 lg:hidden">
-                {filteredRules.map((rule) => {
+                {filteredRules.map((rule: any) => {
                   const supported = isRuleSupported(rule);
                   const protocolKey = getRuleProtocolKey(rule);
                   return (
@@ -916,7 +1044,7 @@ function RulesContent() {
                         </div>
                         <div className="min-w-0">
                           <div className="truncate font-medium">{rule.name}</div>
-                          <div className="mt-1 text-xs text-muted-foreground">{getHostName(rule.hostId)}</div>
+                          <div className="mt-1 text-xs text-muted-foreground">{rule.forwardGroupId ? getForwardGroupName(rule.forwardGroupId) : getHostName(rule.hostId)}</div>
                           {!supported && (
                             <div className="mt-1 text-[11px] text-destructive">
                               {protocolKey ? FORWARD_PROTOCOL_LABELS[protocolKey] : "该协议"} 当前不支持
@@ -979,7 +1107,7 @@ function RulesContent() {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {filteredRules.map((rule) => {
+                    {filteredRules.map((rule: any) => {
                       const supported = isRuleSupported(rule);
                       const protocolKey = getRuleProtocolKey(rule);
                       return (
@@ -1003,8 +1131,8 @@ function RulesContent() {
                           )}
                         </TableCell>
                         <TableCell>
-                          <span className="block truncate text-sm text-muted-foreground" title={getHostName(rule.hostId)}>
-                            {getHostName(rule.hostId)}
+                          <span className="block truncate text-sm text-muted-foreground" title={rule.forwardGroupId ? getForwardGroupName(rule.forwardGroupId) : getHostName(rule.hostId)}>
+                            {rule.forwardGroupId ? getForwardGroupName(rule.forwardGroupId) : getHostName(rule.hostId)}
                           </span>
                         </TableCell>
                         <TableCell>{renderTransfer(rule)}</TableCell>
@@ -1080,7 +1208,13 @@ function RulesContent() {
         />
       )}
 
-      <Dialog open={showDialog} onOpenChange={setShowDialog}>
+      <Dialog
+        open={showDialog}
+        onOpenChange={(open) => {
+          if (!open) resetForm();
+          setShowDialog(open);
+        }}
+      >
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>{editingId ? "编辑规则" : "添加转发规则"}</DialogTitle>
@@ -1089,7 +1223,7 @@ function RulesContent() {
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
               <button
                 type="button"
                 className={routeModeCardClass(form.routeMode === "local", !canUseLocalForward)}
@@ -1121,6 +1255,23 @@ function RulesContent() {
                   <div className="min-w-0">
                     <p className="text-sm font-semibold">隧道转发</p>
                     <p className="mt-1 text-xs text-muted-foreground">选择一条隧道，由入口 Agent 经出口 Agent 转发到最终目标。</p>
+                  </div>
+                </div>
+              </button>
+              <button
+                type="button"
+                className={routeModeCardClass(form.routeMode === "group", !canUseForwardGroup)}
+                onClick={() => setRouteMode("group")}
+                disabled={!canUseForwardGroup}
+                title={!canUseForwardGroup ? "暂无可用转发组" : undefined}
+              >
+                <div className="flex items-start gap-3">
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-emerald-500/10 text-emerald-600">
+                    <Layers3 className="h-4 w-4" />
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-sm font-semibold">转发组</p>
+                    <p className="mt-1 text-xs text-muted-foreground">使用转发组成员作为高可用入口，按优先级故障转移。</p>
                   </div>
                 </div>
               </button>
@@ -1173,6 +1324,55 @@ function RulesContent() {
               </div>
             )}
 
+            {form.routeMode === "group" && (
+              <div className="space-y-3 rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-3">
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
+                  <div className="space-y-2">
+                    <Label>使用转发组</Label>
+                    <Select
+                      value={form.forwardGroupId ? String(form.forwardGroupId) : "none"}
+                      disabled={availableForwardGroups.length === 0}
+                      onValueChange={(v) => {
+                        const nextGroupId = v === "none" ? null : Number(v);
+                        const group = nextGroupId ? forwardGroupById.get(nextGroupId) : null;
+                        setForm({
+                          ...form,
+                          forwardGroupId: nextGroupId,
+                          forwardType: group?.groupType === "tunnel" ? "gost" : form.forwardType,
+                          hostId: null,
+                          tunnelId: null,
+                        });
+                      }}
+                    >
+                      <SelectTrigger><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="none">请选择转发组</SelectItem>
+                        {availableForwardGroups.map((group: any) => (
+                          <SelectItem key={group.id} value={String(group.id)}>
+                            {group.name} / {group.groupType === "tunnel" ? "隧道组" : "主机组"} / {group.members?.length || 0} 成员
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <Badge variant="outline" className="h-9 justify-center gap-1.5 border-emerald-500/30 px-3 text-emerald-600">
+                    <Layers3 className="h-3.5 w-3.5" />
+                    {selectedForwardGroup?.groupType === "tunnel" ? "隧道组" : "主机组"}
+                  </Badge>
+                </div>
+                {selectedForwardGroup && (
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                    {(selectedForwardGroup.members || []).slice(0, 4).map((member: any, index: number) => (
+                      <span key={member.id} className="rounded bg-background/60 px-1.5 py-0.5">
+                        {index + 1}. {member.memberType === "host" ? getHostName(member.hostId) : tunnelDisplayById.get(Number(member.tunnelId))?.shortLabel || `隧道 #${member.tunnelId}`}
+                      </span>
+                    ))}
+                    {(selectedForwardGroup.members || []).length > 4 && <span>+{(selectedForwardGroup.members || []).length - 4}</span>}
+                  </div>
+                )}
+              </div>
+            )}
+
             <div className={`grid grid-cols-1 gap-4 ${form.routeMode === "local" ? "sm:grid-cols-2" : ""}`}>
               <div className="space-y-2">
                 <Label>规则名称</Label>
@@ -1192,7 +1392,7 @@ function RulesContent() {
                   >
                     <SelectTrigger><SelectValue placeholder="选择主机" /></SelectTrigger>
                     <SelectContent>
-                      {hosts?.map((h) => (
+                      {hosts?.map((h: any) => (
                         <SelectItem key={h.id} value={String(h.id)}>{h.name}</SelectItem>
                       ))}
                     </SelectContent>
@@ -1201,8 +1401,8 @@ function RulesContent() {
               )}
             </div>
 
-            <div className={`grid grid-cols-1 gap-4 ${form.routeMode === "local" ? "sm:grid-cols-2" : ""}`}>
-              {form.routeMode === "local" && (
+            <div className={`grid grid-cols-1 gap-4 ${form.routeMode === "local" || (form.routeMode === "group" && selectedForwardGroup?.groupType === "host") ? "sm:grid-cols-2" : ""}`}>
+              {(form.routeMode === "local" || (form.routeMode === "group" && selectedForwardGroup?.groupType === "host")) && (
                 <div className="space-y-2">
                   <Label>转发工具</Label>
                   <Select
@@ -1232,7 +1432,7 @@ function RulesContent() {
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_auto] gap-2 sm:items-start">
               <div className="space-y-2">
-                <Label>{form.routeMode === "tunnel" ? "入口端口" : "源端口"}</Label>
+                <Label>{form.routeMode === "local" ? "源端口" : "入口端口"}</Label>
                 <div className="flex items-center gap-2">
                   <div className="relative flex-1">
                     <Input
@@ -1240,7 +1440,7 @@ function RulesContent() {
                       min={0}
                       max={65535}
                       step={1}
-                      placeholder="0=随机"
+                      placeholder={form.routeMode === "group" ? "例如 8080" : "0=随机"}
                       value={form.sourcePort || ""}
                       onChange={(e) => setForm({ ...form, sourcePort: parseInt(e.target.value) || 0 })}
                       className={`pr-8 ${
@@ -1286,7 +1486,7 @@ function RulesContent() {
                 className="mt-0 gap-2 sm:mt-8"
                 onClick={handleRandomPort}
                 title="随机分配端口"
-                disabled={!form.hostId}
+                disabled={!form.hostId || form.routeMode === "group"}
               >
                 <Shuffle className="h-4 w-4" />
                 随机端口
@@ -1295,7 +1495,7 @@ function RulesContent() {
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div className="space-y-2">
-                <Label>{form.routeMode === "tunnel" ? "最终目标 IP" : "目标 IP"}</Label>
+                <Label>{form.routeMode === "local" ? "目标 IP" : "最终目标 IP"}</Label>
                 <Input
                   placeholder="例如: 10.0.0.1"
                   value={form.targetIp}
@@ -1303,7 +1503,7 @@ function RulesContent() {
                 />
               </div>
               <div className="space-y-2">
-                <Label>{form.routeMode === "tunnel" ? "最终目标端口" : "目标端口"} <span className="text-destructive">*</span></Label>
+                <Label>{form.routeMode === "local" ? "目标端口" : "最终目标端口"} <span className="text-destructive">*</span></Label>
                 <Input
                   type="number"
                   min={1}
@@ -1322,7 +1522,7 @@ function RulesContent() {
             </Button>
             <Button
               onClick={handleSubmit}
-              disabled={isPending || !form.name || !form.hostId || !form.targetIp || !form.targetPort || portStatus === "used" || (form.routeMode === "local" && usableForwardTypes.length === 0) || (form.routeMode === "tunnel" && !form.tunnelId)}
+              disabled={isPending || !form.name || (form.routeMode !== "group" && !form.hostId) || !form.targetIp || !form.targetPort || (form.routeMode !== "group" && portStatus === "used") || (form.routeMode === "local" && usableForwardTypes.length === 0) || (form.routeMode === "tunnel" && !form.tunnelId) || (form.routeMode === "group" && !form.forwardGroupId)}
             >
               {isPending ? "处理中..." : editingId ? "保存" : "创建"}
             </Button>

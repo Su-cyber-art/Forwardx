@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.3.01] - 2026-05-25
+
+### Added
+
+- Added forwarding groups as reusable high-availability entries for forwarding rules, including member priority, DDNS failover, recovery switchback, and DDNS event logging.
+- Added public registration control so administrators can close self-service registration.
+
+### Changed
+
+- Reorganized README around the new forwarding and tunnel orchestration positioning and added the GitHub Star History chart.
+- Bumped panel version to 2.3.01. Agent version remains 2.2.49.
+
 ## [2.2.65] - 2026-05-25
 
 ### Fixed

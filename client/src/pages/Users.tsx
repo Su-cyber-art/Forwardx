@@ -986,7 +986,7 @@ function UsersContent() {
                 maxLength={4000}
                 onChange={(e) => setEmailContent(e.target.value)}
                 placeholder="请输入邮件内容"
-                className="flex min-h-40 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                className="flex min-h-40 w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:border-ring focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
               />
               <p className="text-right text-xs text-muted-foreground">{emailContent.length}/4000</p>
             </div>

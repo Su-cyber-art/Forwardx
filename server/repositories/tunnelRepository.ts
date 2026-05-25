@@ -152,7 +152,11 @@ export async function updateTunnelTestResult(id: number, data: {
 export async function isPortUsedOnHost(hostId: number, sourcePort: number, excludeRuleId?: number): Promise<boolean> {
   const db = await getDb();
   if (!db) return false;
-  const conds: any[] = [eq(forwardRules.hostId, hostId), eq(forwardRules.sourcePort, sourcePort)];
+  const conds: any[] = [
+    eq(forwardRules.hostId, hostId),
+    eq(forwardRules.sourcePort, sourcePort),
+    sql`NOT (${forwardRules.isForwardGroupTemplate} = ${true})`,
+  ];
   if (excludeRuleId) conds.push(sql`${forwardRules.id} != ${excludeRuleId}`);
   const r = await db.select({ count: sql<number>`COUNT(*)` }).from(forwardRules).where(and(...conds));
   return (Number(r[0]?.count) || 0) > 0;
@@ -165,7 +169,10 @@ export async function findAvailablePort(hostId: number, rangeStart?: number | nu
   const start = rangeStart ?? 10000;
   const end = rangeEnd ?? 65535;
   // 鑾峰彇璇ヤ富鏈哄凡鍗犵敤鐨勭鍙?
-  const usedRows = await db.select({ port: forwardRules.sourcePort }).from(forwardRules).where(eq(forwardRules.hostId, hostId));
+  const usedRows = await db.select({ port: forwardRules.sourcePort }).from(forwardRules).where(and(
+    eq(forwardRules.hostId, hostId),
+    sql`NOT (${forwardRules.isForwardGroupTemplate} = ${true})`,
+  ));
   const usedPorts = new Set(usedRows.map(r => r.port));
   // 闅忔満灏濊瘯
   const range = end - start + 1;

@@ -8,11 +8,20 @@ import {
   type InsertForwardGroupMember,
 } from "../../drizzle/schema";
 import { pushAgentRefresh } from "../agentEvents";
+import { appendPanelLog } from "../_core/panelLogger";
 import { getDdnsSettings, updateDdnsRecord } from "../ddns";
 import { getDatabaseKind, getDb, insertAndGetId, nowDate, queryRaw } from "../dbRuntime";
-import { createForwardRule, getForwardRuleById, markForwardRulePendingDelete, updateForwardRule } from "./forwardRuleRepository";
+import {
+  createForwardRule,
+  getForwardGroupChildRules,
+  getForwardGroupChildRulesForMember,
+  getForwardGroupTemplateRules,
+  getForwardRuleById,
+  markForwardRulePendingDelete,
+  updateForwardRule,
+} from "./forwardRuleRepository";
 import { getHostById } from "./hostRepository";
-import { findAvailableTunnelExitPort, getTunnelById, isPortUsedOnHost, updateTunnel } from "./tunnelRepository";
+import { findAvailableTunnelExitPort, getTunnelById, updateTunnel } from "./tunnelRepository";
 
 export type ForwardGroupMemberInput = {
   memberType: "host" | "tunnel";
@@ -21,6 +30,33 @@ export type ForwardGroupMemberInput = {
   priority?: number;
   isEnabled?: boolean;
 };
+
+type ForwardGroupRuleConfig = {
+  sourcePort: number;
+  excludeTemplateRuleId?: number | null;
+};
+
+function quoteId(id: string) {
+  return getDatabaseKind() === "sqlite" ? `"${id}"` : `\`${id}\``;
+}
+
+function toDate(value: unknown): Date | null {
+  if (!value) return null;
+  if (value instanceof Date) return value;
+  const n = Number(value);
+  if (Number.isFinite(n) && n > 0) return new Date(n > 10_000_000_000 ? n : n * 1000);
+  const parsed = new Date(String(value));
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function entryAddressForHost(host: any) {
+  return String(host?.entryIp || host?.ipv4 || host?.ipv6 || host?.ip || "").trim();
+}
+
+function describeDdnsTarget(group: any, value: string, provider?: string) {
+  const providerLabel = provider ? `provider=${provider}` : "provider=disabled";
+  return `${providerLabel} domain=${String(group.domain || "-")} type=${String(group.recordType || "A")} value=${value}`;
+}
 
 export async function getForwardGroups(userId?: number) {
   const db = await getDb();
@@ -35,8 +71,25 @@ export async function getForwardGroups(userId?: number) {
     .from(forwardGroupMembers)
     .where(inArray(forwardGroupMembers.groupId, ids))
     .orderBy(asc(forwardGroupMembers.priority));
+  const templateRules = await db
+    .select({
+      id: forwardRules.id,
+      forwardGroupId: forwardRules.forwardGroupId,
+    })
+    .from(forwardRules)
+    .where(and(
+      inArray(forwardRules.forwardGroupId, ids),
+      eq(forwardRules.isForwardGroupTemplate, true),
+      eq(forwardRules.pendingDelete, false),
+    ));
+  const templateCountByGroup = new Map<number, number>();
+  for (const rule of templateRules as any[]) {
+    const groupId = Number(rule.forwardGroupId || 0);
+    templateCountByGroup.set(groupId, (templateCountByGroup.get(groupId) || 0) + 1);
+  }
   return groupRows.map((group: any) => ({
     ...group,
+    templateRuleCount: templateCountByGroup.get(Number(group.id)) || 0,
     members: members.filter((m: any) => Number(m.groupId) === Number(group.id)),
   }));
 }
@@ -66,6 +119,8 @@ export async function getForwardGroupEvents(groupId: number, limit = 50) {
 }
 
 async function insertForwardGroupEvent(groupId: number, memberId: number | null, type: string, message: string) {
+  const level = type.includes("error") ? "error" : type.includes("skip") ? "warn" : "info";
+  appendPanelLog(level, `[DDNS] group=${groupId} member=${memberId ?? "-"} type=${type} ${message}`);
   await insertAndGetId("forward_group_events", {
     groupId,
     memberId,
@@ -73,10 +128,6 @@ async function insertForwardGroupEvent(groupId: number, memberId: number | null,
     message: message.slice(0, 500),
     createdAt: nowDate(),
   });
-}
-
-function entryAddressForHost(host: any) {
-  return String(host?.entryIp || host?.ipv4 || host?.ipv6 || host?.ip || "").trim();
 }
 
 async function memberEntryAddress(member: any) {
@@ -95,96 +146,190 @@ async function memberEntryAddress(member: any) {
 
 async function targetHostIdForMember(member: ForwardGroupMemberInput) {
   if (member.memberType === "host") {
-    if (!member.hostId) throw new Error("主机成员缺少 Host");
+    if (!member.hostId) throw new Error("Forward group member host is required");
     const host = await getHostById(Number(member.hostId));
-    if (!host) throw new Error("主机不存在");
+    if (!host) throw new Error("Host does not exist");
     return Number(host.id);
   }
-  if (!member.tunnelId) throw new Error("隧道成员缺少 Tunnel");
+  if (!member.tunnelId) throw new Error("Forward group member tunnel is required");
   const tunnel = await getTunnelById(Number(member.tunnelId));
-  if (!tunnel) throw new Error("隧道不存在");
+  if (!tunnel) throw new Error("Tunnel does not exist");
   return Number(tunnel.entryHostId);
 }
 
-async function ensureMemberRule(group: any, member: any) {
-  if (!member.isEnabled || !group.isEnabled) {
-    if (member.ruleId) {
-      const rule = await getForwardRuleById(Number(member.ruleId));
-      await updateForwardRule(Number(member.ruleId), { isEnabled: false, isRunning: !!rule?.isRunning } as any);
-      if (rule) pushAgentRefresh(Number(rule.hostId), "forward-group-member-disabled");
+async function memberEntryHostId(member: any) {
+  if (member.memberType === "host") return Number(member.hostId || 0);
+  const tunnel = await getTunnelById(Number(member.tunnelId));
+  return Number(tunnel?.entryHostId || 0);
+}
+
+export async function getForwardGroupDefaultHostId(groupId: number) {
+  const group = await getForwardGroupById(groupId);
+  if (!group) throw new Error("Forward group does not exist");
+  const members = [...((group as any).members || [])].sort((a, b) => Number(a.priority) - Number(b.priority));
+  for (const member of members) {
+    if (!member.isEnabled) continue;
+    const hostId = await memberEntryHostId(member);
+    if (hostId) return hostId;
+  }
+  for (const member of members) {
+    const hostId = await memberEntryHostId(member);
+    if (hostId) return hostId;
+  }
+  throw new Error("Forward group has no valid entry agent");
+}
+
+async function existingChildRule(templateRuleId: number, memberId: number) {
+  const db = await getDb();
+  const rows = await db.select().from(forwardRules).where(and(
+    eq(forwardRules.forwardGroupRuleId, templateRuleId),
+    eq(forwardRules.forwardGroupMemberId, memberId),
+  )).limit(1);
+  return rows[0];
+}
+
+async function isPortUsedOnHostForGroupChild(hostId: number, sourcePort: number, ignoreRuleIds: number[]) {
+  const table = quoteId("forward_rules");
+  const idCol = quoteId("id");
+  const hostCol = quoteId("hostId");
+  const portCol = quoteId("sourcePort");
+  const pendingCol = quoteId("pendingDelete");
+  const ignore = ignoreRuleIds.filter((id) => Number(id) > 0);
+  const ignoreSql = ignore.length > 0 ? ` AND ${idCol} NOT IN (${ignore.map(() => "?").join(",")})` : "";
+  const rows = await queryRaw<{ count: number }>(
+    `SELECT COUNT(*) AS count FROM ${table} WHERE ${hostCol} = ? AND ${portCol} = ? AND ${pendingCol} = 0${ignoreSql}`,
+    [hostId, sourcePort, ...ignore],
+  );
+  return (Number(rows[0]?.count) || 0) > 0;
+}
+
+async function assertEntryPortAllowed(member: any, sourcePort: number) {
+  if (member.memberType === "tunnel") {
+    const tunnel = await getTunnelById(Number(member.tunnelId));
+    if (!tunnel) throw new Error("Tunnel does not exist");
+    const start = (tunnel as any).portRangeStart;
+    const end = (tunnel as any).portRangeEnd;
+    if (start != null && end != null && (sourcePort < Number(start) || sourcePort > Number(end))) {
+      throw new Error(`Entry port must be within tunnel range ${start}-${end}`);
+    }
+    return;
+  }
+  const host = await getHostById(Number(member.hostId));
+  if (!host) throw new Error("Host does not exist");
+  const start = (host as any).portRangeStart;
+  const end = (host as any).portRangeEnd;
+  if (start != null && end != null && (sourcePort < Number(start) || sourcePort > Number(end))) {
+    throw new Error(`Entry port must be within host range ${start}-${end}`);
+  }
+}
+
+export async function validateForwardGroupRuleConfig(groupId: number, config: ForwardGroupRuleConfig) {
+  const group = await getForwardGroupById(groupId);
+  if (!group) throw new Error("Forward group does not exist");
+  const sourcePort = Number(config.sourcePort || 0);
+  if (!Number.isInteger(sourcePort) || sourcePort < 1 || sourcePort > 65535) {
+    throw new Error("Forward group entry port must be 1-65535");
+  }
+  const members = [...((group as any).members || [])].sort((a, b) => Number(a.priority) - Number(b.priority));
+  if (members.length === 0) throw new Error("Forward group has no members");
+
+  for (const member of members) {
+    if (!member.isEnabled) continue;
+    const hostId = await memberEntryHostId(member);
+    if (!hostId) throw new Error("Forward group member has no valid entry agent");
+    await assertEntryPortAllowed(member, sourcePort);
+    const existing = config.excludeTemplateRuleId
+      ? await existingChildRule(Number(config.excludeTemplateRuleId), Number(member.id))
+      : null;
+    const used = await isPortUsedOnHostForGroupChild(
+      hostId,
+      sourcePort,
+      [Number(config.excludeTemplateRuleId || 0), Number(existing?.id || 0)].filter(Boolean),
+    );
+    if (used) throw new Error(`Entry agent port ${sourcePort} is already used`);
+  }
+  return group;
+}
+
+async function refreshRuleEndpoints(rule: any, reason: string) {
+  if (!rule) return;
+  pushAgentRefresh(Number(rule.hostId), reason);
+  if ((rule as any).tunnelId) {
+    const tunnel = await getTunnelById(Number((rule as any).tunnelId));
+    if (tunnel) {
+      pushAgentRefresh(Number(tunnel.entryHostId), `${reason}-entry`);
+      pushAgentRefresh(Number(tunnel.exitHostId), `${reason}-exit`);
+    }
+  }
+}
+
+async function ensureMemberRuleForTemplate(group: any, templateRule: any, member: any) {
+  const existing = await existingChildRule(Number(templateRule.id), Number(member.id));
+  const enabled = !!group.isEnabled && !!templateRule.isEnabled && !!member.isEnabled;
+  if (!enabled) {
+    if (existing) {
+      await updateForwardRule(Number(existing.id), { isEnabled: false, isRunning: !!existing.isRunning } as any);
+      await refreshRuleEndpoints(existing, "forward-group-child-disabled");
     }
     return null;
   }
 
-  const hostId = member.memberType === "host"
-    ? Number(member.hostId)
-    : Number((await getTunnelById(Number(member.tunnelId)))?.entryHostId || 0);
-  if (!hostId) throw new Error("转发组成员入口 Agent 无效");
+  const hostId = await memberEntryHostId(member);
+  if (!hostId) throw new Error("Forward group member has no valid entry agent");
+  await assertEntryPortAllowed(member, Number(templateRule.sourcePort));
+  const used = await isPortUsedOnHostForGroupChild(
+    hostId,
+    Number(templateRule.sourcePort),
+    [Number(templateRule.id), Number(existing?.id || 0)].filter(Boolean),
+  );
+  if (used) throw new Error(`Entry agent port ${templateRule.sourcePort} is already used`);
 
-  const used = await isPortUsedOnHost(hostId, Number(group.sourcePort), member.ruleId ? Number(member.ruleId) : undefined);
-  if (used) throw new Error(`入口 Agent 端口 ${group.sourcePort} 已被占用`);
-
-  let tunnelExitPort: number | null = null;
   let tunnelId: number | null = null;
+  let tunnelExitPort: number | null = null;
   if (member.memberType === "tunnel") {
     tunnelId = Number(member.tunnelId);
     const tunnel = await getTunnelById(tunnelId);
-    if (!tunnel) throw new Error("隧道不存在");
-    if (!tunnel.isEnabled) throw new Error(`隧道 ${tunnel.name} 已停用`);
-    if (member.ruleId) {
-      const db = await getDb();
-      const existing = (await db.select().from(forwardRules).where(eq(forwardRules.id, Number(member.ruleId))).limit(1))[0];
-      tunnelExitPort = Number(existing?.tunnelExitPort || 0) || null;
-    }
+    if (!tunnel) throw new Error("Tunnel does not exist");
+    if (!tunnel.isEnabled) throw new Error(`Tunnel ${tunnel.name} is disabled`);
+    tunnelExitPort = Number(existing?.tunnelExitPort || 0) || null;
     if (!tunnelExitPort) {
       const exit = await getHostById(Number(tunnel.exitHostId));
       tunnelExitPort = await findAvailableTunnelExitPort(Number(tunnel.exitHostId), (exit as any)?.portRangeStart, (exit as any)?.portRangeEnd);
-      if (!tunnelExitPort) throw new Error("出口 Agent 已无可用隧道端口");
+      if (!tunnelExitPort) throw new Error("Tunnel exit agent has no available port");
     }
   }
 
   const payload: any = {
     hostId,
-    name: `[组] ${group.name}`,
-    forwardType: member.memberType === "tunnel" ? "gost" : group.forwardType,
-    protocol: group.protocol,
+    name: `[Group:${group.name}] ${templateRule.name}`,
+    forwardType: member.memberType === "tunnel" ? "gost" : templateRule.forwardType,
+    protocol: templateRule.protocol,
     gostMode: "direct",
     gostRelayHost: null,
     gostRelayPort: null,
     tunnelId,
     tunnelExitPort,
-    sourcePort: Number(group.sourcePort),
-    targetIp: group.targetIp,
-    targetPort: Number(group.targetPort),
+    forwardGroupId: Number(group.id),
+    forwardGroupRuleId: Number(templateRule.id),
+    forwardGroupMemberId: Number(member.id),
+    isForwardGroupTemplate: false,
+    sourcePort: Number(templateRule.sourcePort),
+    targetIp: templateRule.targetIp,
+    targetPort: Number(templateRule.targetPort),
     isEnabled: true,
     isRunning: false,
     pendingDelete: false,
-    userId: Number(group.userId),
+    userId: Number(templateRule.userId),
   };
 
-  if (member.ruleId) {
-    await updateForwardRule(Number(member.ruleId), payload);
-    pushAgentRefresh(hostId, "forward-group-member-updated");
-    if (member.memberType === "tunnel" && tunnelId) {
-      const tunnel = await getTunnelById(tunnelId);
-      if (tunnel) {
-        pushAgentRefresh(Number(tunnel.entryHostId), "forward-group-member-updated-entry");
-        pushAgentRefresh(Number(tunnel.exitHostId), "forward-group-member-updated-exit");
-      }
-    }
-    return Number(member.ruleId);
+  if (existing) {
+    await updateForwardRule(Number(existing.id), payload);
+    await refreshRuleEndpoints({ ...existing, ...payload, id: existing.id }, "forward-group-child-updated");
+    return Number(existing.id);
   }
+
   const ruleId = await createForwardRule(payload);
-  const db = await getDb();
-  await db.update(forwardGroupMembers).set({ ruleId, updatedAt: nowDate() }).where(eq(forwardGroupMembers.id, member.id));
-  pushAgentRefresh(hostId, "forward-group-member-created");
-  if (member.memberType === "tunnel" && tunnelId) {
-    const tunnel = await getTunnelById(tunnelId);
-    if (tunnel) {
-      pushAgentRefresh(Number(tunnel.entryHostId), "forward-group-member-created-entry");
-      pushAgentRefresh(Number(tunnel.exitHostId), "forward-group-member-created-exit");
-    }
-  }
+  await refreshRuleEndpoints({ ...payload, id: ruleId }, "forward-group-child-created");
   return ruleId;
 }
 
@@ -192,37 +337,69 @@ async function removeManagedRule(ruleId: number) {
   const rule = await getForwardRuleById(ruleId);
   if (!rule) return;
   await markForwardRulePendingDelete(ruleId);
-  pushAgentRefresh(Number(rule.hostId), "forward-group-member-deleted");
-  if ((rule as any).tunnelId) {
-    const tunnel = await getTunnelById(Number((rule as any).tunnelId));
-    if (tunnel) {
-      pushAgentRefresh(Number(tunnel.entryHostId), "forward-group-member-deleted-entry");
-      pushAgentRefresh(Number(tunnel.exitHostId), "forward-group-member-deleted-exit");
-    }
-  }
+  await refreshRuleEndpoints(rule, "forward-group-child-deleted");
 }
 
 export async function syncForwardGroupRules(groupId: number) {
   const group = await getForwardGroupById(groupId);
   if (!group) return;
   const db = await getDb();
-  for (const member of group.members as any[]) {
-    const ruleId = await ensureMemberRule(group, member);
+  const members = ((group as any).members || []) as any[];
+  const templates = await getForwardGroupTemplateRules(groupId);
+  const liveMemberIds = new Set(members.map((m: any) => Number(m.id)));
+  const liveTemplateIds = new Set((templates as any[]).map((rule: any) => Number(rule.id)));
+
+  const childRules = await getForwardGroupChildRules(groupId);
+  for (const child of childRules as any[]) {
+    if (!liveMemberIds.has(Number(child.forwardGroupMemberId)) || !liveTemplateIds.has(Number(child.forwardGroupRuleId))) {
+      await removeManagedRule(Number(child.id));
+    }
+  }
+
+  for (const member of members) {
+    if (member.ruleId) {
+      await removeManagedRule(Number(member.ruleId));
+      await db.update(forwardGroupMembers).set({ ruleId: null, updatedAt: nowDate() } as any).where(eq(forwardGroupMembers.id, member.id));
+    }
+  }
+
+  for (const template of templates as any[]) {
+    for (const member of members) {
+      const ruleId = await ensureMemberRuleForTemplate(group, template, member);
+      if (ruleId) {
+        await db.update(forwardRules).set({ isRunning: false, updatedAt: nowDate() }).where(eq(forwardRules.id, ruleId));
+      }
+    }
+    await db.update(forwardRules).set({ isRunning: false, updatedAt: nowDate() }).where(eq(forwardRules.id, template.id));
+  }
+
+  for (const member of members) {
     if (member.memberType === "tunnel" && member.tunnelId) {
       const tunnel = await getTunnelById(Number(member.tunnelId));
       if (tunnel) await updateTunnel(Number(member.tunnelId), { isRunning: false } as any);
     }
-    if (ruleId) {
-      const rule = (await db.select().from(forwardRules).where(eq(forwardRules.id, ruleId)).limit(1))[0];
-      if (rule) await db.update(forwardRules).set({ isRunning: false, updatedAt: nowDate() }).where(eq(forwardRules.id, ruleId));
-    }
   }
 }
 
+export async function syncForwardGroupTemplateRule(templateRuleId: number) {
+  const template = await getForwardRuleById(templateRuleId);
+  if (!template || !(template as any).forwardGroupId) return;
+  await syncForwardGroupRules(Number((template as any).forwardGroupId));
+}
+
 export async function createForwardGroup(data: InsertForwardGroup, members: ForwardGroupMemberInput[]) {
-  if (members.length === 0) throw new Error("转发组至少需要一个成员");
+  if (members.length === 0) throw new Error("Forward group requires at least one member");
   for (const member of members) await targetHostIdForMember(member);
-  const id = await insertAndGetId("forward_groups", { ...data, createdAt: nowDate(), updatedAt: nowDate() } as any);
+  const id = await insertAndGetId("forward_groups", {
+    ...data,
+    forwardType: (data as any).forwardType || "iptables",
+    sourcePort: Number((data as any).sourcePort || 1),
+    protocol: (data as any).protocol || "both",
+    targetIp: (data as any).targetIp || "0.0.0.0",
+    targetPort: Number((data as any).targetPort || 1),
+    createdAt: nowDate(),
+    updatedAt: nowDate(),
+  } as any);
   for (const [index, member] of members.entries()) {
     await insertAndGetId("forward_group_members", {
       groupId: id,
@@ -235,8 +412,7 @@ export async function createForwardGroup(data: InsertForwardGroup, members: Forw
       updatedAt: nowDate(),
     });
   }
-  await syncForwardGroupRules(id);
-  await insertForwardGroupEvent(id, null, "created", "转发组已创建并同步成员规则");
+  await insertForwardGroupEvent(id, null, "created", "Forward group created; use it from forwarding rules to generate member routes.");
   return id;
 }
 
@@ -247,19 +423,21 @@ export async function updateForwardGroup(id: number, data: Partial<InsertForward
 }
 
 export async function replaceForwardGroupMembers(groupId: number, members: ForwardGroupMemberInput[]) {
-  if (members.length === 0) throw new Error("转发组至少需要一个成员");
+  if (members.length === 0) throw new Error("Forward group requires at least one member");
   const db = await getDb();
   const existing = await db.select().from(forwardGroupMembers).where(eq(forwardGroupMembers.groupId, groupId));
-  const keepKeys = new Set(
-    members.map((m) => `${m.memberType}:${m.memberType === "host" ? m.hostId : m.tunnelId}`),
-  );
+  const keepKeys = new Set(members.map((m) => `${m.memberType}:${m.memberType === "host" ? m.hostId : m.tunnelId}`));
+
   for (const old of existing as any[]) {
     const key = `${old.memberType}:${old.memberType === "host" ? old.hostId : old.tunnelId}`;
     if (!keepKeys.has(key)) {
+      const childRules = await getForwardGroupChildRulesForMember(Number(old.id));
+      for (const rule of childRules as any[]) await removeManagedRule(Number(rule.id));
       if (old.ruleId) await removeManagedRule(Number(old.ruleId));
       await db.delete(forwardGroupMembers).where(eq(forwardGroupMembers.id, old.id));
     }
   }
+
   const current = await db.select().from(forwardGroupMembers).where(eq(forwardGroupMembers.groupId, groupId));
   for (const [index, member] of members.entries()) {
     await targetHostIdForMember(member);
@@ -290,6 +468,12 @@ export async function replaceForwardGroupMembers(groupId: number, members: Forwa
 
 export async function deleteForwardGroup(id: number) {
   const db = await getDb();
+  const childRules = await getForwardGroupChildRules(id);
+  for (const rule of childRules as any[]) await removeManagedRule(Number(rule.id));
+  const templates = await getForwardGroupTemplateRules(id);
+  for (const template of templates as any[]) {
+    await markForwardRulePendingDelete(Number(template.id));
+  }
   const members = await db.select().from(forwardGroupMembers).where(eq(forwardGroupMembers.groupId, id));
   for (const member of members as any[]) {
     if (member.ruleId) await removeManagedRule(Number(member.ruleId));
@@ -307,13 +491,13 @@ export async function reorderForwardGroupMembers(groupId: number, memberIds: num
       eq(forwardGroupMembers.id, memberId),
     ));
   }
-  await insertForwardGroupEvent(groupId, null, "reorder", "成员优先级已更新");
+  await insertForwardGroupEvent(groupId, null, "reorder", "Member priority updated.");
 }
 
 async function latestTcping(ruleId: number) {
-  const table = getDatabaseKind() === "sqlite" ? `"tcping_stats"` : "`tcping_stats`";
+  const table = quoteId("tcping_stats");
   const result = await queryRaw<any>(
-    `SELECT * FROM ${table} WHERE ruleId = ? ORDER BY recordedAt DESC LIMIT 1`,
+    `SELECT * FROM ${table} WHERE ${quoteId("ruleId")} = ? ORDER BY ${quoteId("recordedAt")} DESC LIMIT 1`,
     [ruleId],
   );
   return result[0];
@@ -321,45 +505,59 @@ async function latestTcping(ruleId: number) {
 
 async function evaluateMemberHealth(member: any, group: any) {
   const now = nowDate();
-  const rule = member.ruleId
-    ? (await (await getDb()).select().from(forwardRules).where(eq(forwardRules.id, Number(member.ruleId))).limit(1))[0]
-    : null;
+  const childRules = await getForwardGroupChildRulesForMember(Number(member.id));
   let healthy = false;
   let latencyMs: number | null = null;
   let message = "";
 
   if (!member.isEnabled) {
-    message = "成员已停用";
-  } else if (!rule || !rule.isEnabled || rule.pendingDelete) {
-    message = "成员规则未启用";
-  } else if (!rule.isRunning) {
-    message = "成员规则尚未运行";
+    message = "Member disabled";
+  } else if (childRules.length === 0) {
+    message = "No forwarding rule is using this group yet";
   } else {
-    const stat = await latestTcping(Number(rule.id));
-    if (stat) {
-      latencyMs = stat.isTimeout ? null : Number(stat.latencyMs || 0) || null;
-      healthy = !stat.isTimeout;
-      message = stat.isTimeout ? "TCPing 超时" : "TCPing 正常";
-    } else {
-      healthy = true;
-      message = "规则运行中，等待 TCPing 数据";
+    healthy = true;
+    const latencies: number[] = [];
+    for (const rule of childRules as any[]) {
+      if (!rule.isEnabled || rule.pendingDelete) {
+        healthy = false;
+        message = "Member rule disabled";
+        break;
+      }
+      if (!rule.isRunning) {
+        healthy = false;
+        message = "Member rule not running yet";
+        break;
+      }
+      const stat = await latestTcping(Number(rule.id));
+      if (stat?.isTimeout) {
+        healthy = false;
+        message = "TCPing timeout";
+        break;
+      }
+      if (stat && typeof stat.latencyMs !== "undefined" && stat.latencyMs !== null) {
+        latencies.push(Number(stat.latencyMs));
+      }
+    }
+    if (healthy) {
+      latencyMs = latencies.length > 0 ? Math.round(latencies.reduce((sum, v) => sum + v, 0) / latencies.length) : null;
+      message = latencies.length > 0 ? "TCPing healthy" : "Rules running; waiting for TCPing data";
     }
   }
 
   const db = await getDb();
-  const prevFailure = member.failureSince ? new Date(member.failureSince) : null;
-  const prevHealthy = member.healthySince ? new Date(member.healthySince) : null;
+  const prevFailure = toDate(member.failureSince);
+  const prevHealthy = toDate(member.healthySince);
+  const failureSince = healthy ? null : (prevFailure || now);
+  const healthySince = healthy ? (prevHealthy || now) : null;
   await db.update(forwardGroupMembers).set({
     healthStatus: healthy ? "healthy" : "unhealthy",
     lastLatencyMs: latencyMs,
-    failureSince: healthy ? null : (prevFailure || now),
-    healthySince: healthy ? (prevHealthy || now) : null,
+    failureSince,
+    healthySince,
     lastCheckedAt: now,
     updatedAt: now,
   } as any).where(eq(forwardGroupMembers.id, member.id));
 
-  const failureSince = healthy ? null : (prevFailure || now);
-  const healthySince = healthy ? (prevHealthy || now) : null;
   const failedLongEnough = !!failureSince && Date.now() - failureSince.getTime() >= Number(group.failoverSeconds || 60) * 1000;
   const recoveredLongEnough = !!healthySince && Date.now() - healthySince.getTime() >= Number(group.recoverSeconds || 120) * 1000;
   return { ...member, healthy, latencyMs, message, failureSince, healthySince, failedLongEnough, recoveredLongEnough };
@@ -371,18 +569,32 @@ export async function runForwardGroupFailoverSweep() {
   const ddnsSettings = await getDdnsSettings();
   for (const group of groups as any[]) {
     if (!group.isEnabled) continue;
-    const members = [...(group.members || [])].sort((a, b) => Number(a.priority) - Number(b.priority));
-    if (members.length === 0) continue;
-    const evaluated = [];
-    for (const member of members) evaluated.push(await evaluateMemberHealth(member, group));
-    if (!group.domain) {
+    const templates = await getForwardGroupTemplateRules(Number(group.id));
+    if (templates.length === 0) {
       await db.update(forwardGroups).set({
-        lastStatus: evaluated.some((m) => m.healthy) ? "healthy" : "down",
-        lastMessage: "未配置 DDNS 域名，仅更新成员健康状态",
+        lastStatus: "unknown",
+        lastMessage: "No forwarding rule is using this group yet.",
         updatedAt: nowDate(),
       }).where(eq(forwardGroups.id, group.id));
       continue;
     }
+
+    await syncForwardGroupRules(Number(group.id));
+    const members = [...(group.members || [])].sort((a, b) => Number(a.priority) - Number(b.priority));
+    if (members.length === 0) continue;
+
+    const evaluated = [];
+    for (const member of members) evaluated.push(await evaluateMemberHealth(member, group));
+
+    if (!group.domain) {
+      await db.update(forwardGroups).set({
+        lastStatus: evaluated.some((m) => m.healthy) ? "healthy" : "down",
+        lastMessage: "DDNS domain is not configured; member health was updated only.",
+        updatedAt: nowDate(),
+      }).where(eq(forwardGroups.id, group.id));
+      continue;
+    }
+
     const active = evaluated.find((m) => Number(m.id) === Number(group.activeMemberId));
     const firstHealthy = evaluated.find((m) => m.healthy);
     const failbackCandidate = evaluated.find((m) => m.healthy && m.recoveredLongEnough);
@@ -396,37 +608,48 @@ export async function runForwardGroupFailoverSweep() {
       : shouldFailover
         ? firstHealthy
         : active;
+
     if (!next) {
       await db.update(forwardGroups).set({
         lastStatus: "down",
-        lastMessage: "没有健康成员可用于 DDNS 切换",
+        lastMessage: "No healthy member is available for DDNS failover.",
         updatedAt: nowDate(),
       }).where(eq(forwardGroups.id, group.id));
       continue;
     }
+
     const value = await memberEntryAddress(next);
     if (!value) {
-      await insertForwardGroupEvent(group.id, next.id, "ddns-error", "健康成员缺少入口地址");
+      await insertForwardGroupEvent(group.id, next.id, "ddns-error", "Healthy member has no entry address.");
       continue;
     }
+
     if (!ddnsSettings.enabled || ddnsSettings.provider === "disabled") {
+      const detail = describeDdnsTarget(group, value, ddnsSettings.provider);
       await db.update(forwardGroups).set({
         activeMemberId: next.id,
         lastStatus: "healthy",
-        lastMessage: `DDNS 未启用，推荐入口 ${value}`,
+        lastMessage: `DDNS disabled; recommended entry ${value}`,
         updatedAt: nowDate(),
       }).where(eq(forwardGroups.id, group.id));
+      await insertForwardGroupEvent(group.id, next.id, "ddns-skip", `DDNS disabled; record was not updated; ${detail}`);
       continue;
     }
+
     if (Number(group.activeMemberId) === Number(next.id) && String(group.lastDdnsValue || "") === value) {
+      const detail = describeDdnsTarget(group, value, ddnsSettings.provider);
       await db.update(forwardGroups).set({
         lastStatus: "healthy",
-        lastMessage: `当前入口 ${value}`,
+        lastMessage: `Current entry ${value}`,
         updatedAt: nowDate(),
       }).where(eq(forwardGroups.id, group.id));
+      await insertForwardGroupEvent(group.id, next.id, "ddns-current", `DDNS current; record already points to the selected entry; ${detail}`);
       continue;
     }
+
     try {
+      const detail = describeDdnsTarget(group, value, ddnsSettings.provider);
+      await insertForwardGroupEvent(group.id, next.id, "ddns-update", `Starting DDNS update; ${detail}`);
       await updateDdnsRecord({
         groupId: Number(group.id),
         domain: String(group.domain || ""),
@@ -439,18 +662,19 @@ export async function runForwardGroupFailoverSweep() {
         lastDdnsAt: nowDate(),
         lastFailoverAt: nowDate(),
         lastStatus: "healthy",
-        lastMessage: `DDNS 已切换到 ${value}`,
+        lastMessage: `DDNS switched to ${value}`,
         updatedAt: nowDate(),
       }).where(eq(forwardGroups.id, group.id));
-      await insertForwardGroupEvent(group.id, next.id, "failover", `DDNS 已切换到 ${value}`);
+      await insertForwardGroupEvent(group.id, next.id, "failover", `DDNS switched; ${detail}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      const detail = describeDdnsTarget(group, value, ddnsSettings.provider);
       await db.update(forwardGroups).set({
         lastStatus: "error",
         lastMessage: message,
         updatedAt: nowDate(),
       }).where(eq(forwardGroups.id, group.id));
-      await insertForwardGroupEvent(group.id, next.id, "ddns-error", message);
+      await insertForwardGroupEvent(group.id, next.id, "ddns-error", `DDNS update failed; ${message}; ${detail}`);
     }
   }
 }
