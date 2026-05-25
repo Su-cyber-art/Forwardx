@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.3.04] - 2026-05-25
+
+### Fixed
+
+- Fixed panel upgrades failing with "would clobber existing tag" after release tags were rewritten upstream.
+
+### Changed
+
+- Panel install and upgrade scripts now force-sync remote branches and tags before checking out the target version.
+- Bumped panel version to 2.3.04. Agent version remains 2.2.49.
+
 ## [2.3.03] - 2026-05-25
 
 ### Added

@@ -35,6 +35,12 @@ latest_tag() {
   git -C "$APP_DIR" tag --sort=-v:refname | head -1 || true
 }
 
+fetch_source_refs() {
+  git -C "$APP_DIR" fetch --force --prune origin \
+    "+refs/heads/*:refs/remotes/origin/*" \
+    "+refs/tags/*:refs/tags/*"
+}
+
 install_deps() {
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update -qq
@@ -59,11 +65,12 @@ install_deps() {
 sync_source() {
   local target="${FORWARDX_TARGET_VERSION:-}"
   if [ -d "$APP_DIR/.git" ]; then
-    git -C "$APP_DIR" fetch --tags origin
+    git -C "$APP_DIR" remote set-url origin "$REPO_URL" || true
+    fetch_source_refs
   else
     rm -rf "$APP_DIR"
     git clone "$REPO_URL" "$APP_DIR"
-    git -C "$APP_DIR" fetch --tags origin
+    fetch_source_refs
   fi
 
   if [ -z "$target" ]; then
