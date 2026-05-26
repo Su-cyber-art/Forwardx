@@ -4,11 +4,12 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Eye, EyeOff, Loader2, Sun, Moon, RefreshCw, UserPlus, LogIn, Send } from "lucide-react";
+import { Eye, EyeOff, Loader2, Sun, Moon, RefreshCw, UserPlus, LogIn, Send, Settings as SettingsIcon } from "lucide-react";
 import { toast } from "sonner";
 import { useTheme } from "@/contexts/ThemeContext";
 import { useLocation } from "wouter";
 import { mobileAuth } from "@/lib/mobileAuth";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogTitle } from "@/components/ui/dialog";
 
 const REGISTRATION_CLOSED_MESSAGE = "当前注册未开放，请联系管理员";
 
@@ -36,6 +37,10 @@ function getTelegramLoginDomainStatus() {
     return { valid: false, message: "Telegram 快捷登录不支持直接使用 IP 访问，请使用在 BotFather 里配置过的域名打开面板。" };
   }
   return { valid: true, message: "" };
+}
+
+function isMobileNetworkError(message: string) {
+  return /failed to fetch|fetch failed|networkerror/i.test(message);
 }
 
 type TelegramLoginPayload = {
@@ -68,9 +73,11 @@ export default function Login() {
   const [captchaAnswer, setCaptchaAnswer] = useState("");
   const [showCaptcha, setShowCaptcha] = useState(false);
   const [telegramLoginCode, setTelegramLoginCode] = useState<string | null>(null);
-  const [panelUrl, setPanelUrl] = useState(() => mobileAuth.getPanelUrl());
+  const [panelUrlDraft, setPanelUrlDraft] = useState(() => mobileAuth.getPanelUrl());
+  const [showPanelSettings, setShowPanelSettings] = useState(() => mobileAuth.isNative && !mobileAuth.hasPanelUrl());
   const telegramWidgetRef = useRef<HTMLDivElement | null>(null);
   const { resolvedTheme, setTheme } = useTheme();
+  const hasMobilePanelUrl = !mobileAuth.isNative || mobileAuth.hasPanelUrl();
 
   useEffect(() => {
     const nextMode = new URLSearchParams(location.split("?")[1] || "").get("mode") === "register" ? "register" : "login";
@@ -79,9 +86,13 @@ export default function Login() {
 
   const utils = trpc.useUtils();
   const { data: emailConfig } = trpc.auth.emailConfig.useQuery(undefined, {
+    enabled: hasMobilePanelUrl,
+    retry: false,
     refetchOnWindowFocus: false,
   });
   const { data: telegramLoginStatus } = trpc.telegram.loginStatus.useQuery(undefined, {
+    enabled: hasMobilePanelUrl,
+    retry: false,
     refetchOnWindowFocus: false,
   });
   const registrationEnabled = emailConfig?.registrationEnabled !== false;
@@ -95,20 +106,24 @@ export default function Login() {
 
   // 获取验证码
   const captchaQuery = trpc.auth.getCaptcha.useQuery(undefined, {
-    enabled: showCaptcha,
+    enabled: showCaptcha && hasMobilePanelUrl,
+    retry: false,
     refetchOnWindowFocus: false,
   });
 
   const refreshCaptcha = useCallback(() => {
+    if (!hasMobilePanelUrl) {
+      setCaptchaAnswer("");
+      return;
+    }
     captchaQuery.refetch();
     setCaptchaAnswer("");
-  }, [captchaQuery]);
+  }, [captchaQuery, hasMobilePanelUrl]);
 
   // 登录 mutation
   const loginMutation = trpc.auth.login.useMutation({
     onSuccess: (data) => {
       if (mobileAuth.isNative) {
-        mobileAuth.setPanelUrl(panelUrl);
         mobileAuth.setCredentials(username, password);
         mobileAuth.setToken(data.mobileToken);
       }
@@ -118,6 +133,11 @@ export default function Login() {
     },
     onError: (error) => {
       const msg = error.message || "";
+      if (mobileAuth.isNative && isMobileNetworkError(msg)) {
+        toast.error("无法连接面板，请检查右上角面板地址");
+        setShowPanelSettings(true);
+        return;
+      }
       if (msg === "CAPTCHA_REQUIRED" || msg === "CAPTCHA_REQUIRED_AFTER_FAIL") {
         setShowCaptcha(true);
         refreshCaptcha();
@@ -166,14 +186,28 @@ export default function Login() {
       refreshCaptcha();
     },
     onError: (error) => {
-      toast.error(error.message || "注册失败");
+      const msg = error.message || "";
+      if (mobileAuth.isNative && isMobileNetworkError(msg)) {
+        toast.error("无法连接面板，请检查右上角面板地址");
+        setShowPanelSettings(true);
+        return;
+      }
+      toast.error(msg || "注册失败");
       refreshCaptcha();
     },
   });
 
   const sendEmailCodeMutation = trpc.auth.sendEmailCode.useMutation({
     onSuccess: () => toast.success("验证码已发送，5 分钟内有效"),
-    onError: (error) => toast.error(error.message || "发送验证码失败"),
+    onError: (error) => {
+      const msg = error.message || "";
+      if (mobileAuth.isNative && isMobileNetworkError(msg)) {
+        toast.error("无法连接面板，请检查右上角面板地址");
+        setShowPanelSettings(true);
+        return;
+      }
+      toast.error(msg || "发送验证码失败");
+    },
   });
 
   // 切换到注册模式时自动显示验证码
@@ -222,12 +256,11 @@ export default function Login() {
   const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
     if (mobileAuth.isNative) {
-      const normalizedPanelUrl = panelUrl.trim().replace(/\/+$/, "");
-      if (!/^https?:\/\/.+/i.test(normalizedPanelUrl)) {
-        toast.error("请输入完整面板地址，例如 https://panel.example.com");
+      if (!mobileAuth.hasPanelUrl()) {
+        toast.error("请先在右上角设置面板地址");
+        setShowPanelSettings(true);
         return;
       }
-      mobileAuth.setPanelUrl(normalizedPanelUrl);
     }
     if (!username.trim() || !password.trim()) {
       toast.error("请输入用户名和密码");
@@ -252,6 +285,11 @@ export default function Login() {
 
   const handleRegister = (e: React.FormEvent) => {
     e.preventDefault();
+    if (mobileAuth.isNative && !mobileAuth.hasPanelUrl()) {
+      toast.error("请先在右上角设置面板地址");
+      setShowPanelSettings(true);
+      return;
+    }
     if (!registrationEnabled) {
       toast.info(REGISTRATION_CLOSED_MESSAGE);
       setMode("login");
@@ -306,24 +344,52 @@ export default function Login() {
     setTheme(resolvedTheme === "dark" ? "light" : "dark");
   };
 
+  const savePanelUrl = () => {
+    const normalized = mobileAuth.normalizePanelUrl(panelUrlDraft);
+    if (!mobileAuth.isValidPanelUrl(normalized)) {
+      toast.error("请输入完整面板地址，例如 http://45.129.9.159:3000");
+      return;
+    }
+    mobileAuth.setPanelUrl(normalized);
+    setPanelUrlDraft(normalized);
+    setShowPanelSettings(false);
+    setCaptchaAnswer("");
+    void utils.invalidate();
+    toast.success("面板地址已保存");
+  };
+
   const isPending = loginMutation.isPending || registerMutation.isPending;
   const isTelegramPending = telegramLoginMutation.isPending || telegramWidgetLoginMutation.isPending;
 
   return (
     <div className="mobile-login-screen flex items-center justify-center min-h-screen bg-background relative px-3 sm:px-4">
-      {/* Theme toggle */}
-      <button
-        onClick={toggleTheme}
-        className="absolute top-4 right-4 h-9 w-9 flex items-center justify-center hover:bg-accent rounded-lg transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        aria-label="Toggle theme"
-        title={resolvedTheme === "dark" ? "切换到白天模式" : "切换到黑夜模式"}
-      >
-        {resolvedTheme === "dark" ? (
-          <Sun className="h-5 w-5 text-muted-foreground" />
-        ) : (
-          <Moon className="h-5 w-5 text-muted-foreground" />
+      <div className="absolute right-4 top-4 flex items-center gap-2">
+        {mobileAuth.isNative && (
+          <button
+            onClick={() => {
+              setPanelUrlDraft(mobileAuth.getPanelUrl());
+              setShowPanelSettings(true);
+            }}
+            className="h-9 w-9 flex items-center justify-center hover:bg-accent rounded-lg transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            aria-label="设置面板地址"
+            title="设置面板地址"
+          >
+            <SettingsIcon className={mobileAuth.hasPanelUrl() ? "h-5 w-5 text-muted-foreground" : "h-5 w-5 text-amber-500"} />
+          </button>
         )}
-      </button>
+        <button
+          onClick={toggleTheme}
+          className="h-9 w-9 flex items-center justify-center hover:bg-accent rounded-lg transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          aria-label="Toggle theme"
+          title={resolvedTheme === "dark" ? "切换到白天模式" : "切换到黑夜模式"}
+        >
+          {resolvedTheme === "dark" ? (
+            <Sun className="h-5 w-5 text-muted-foreground" />
+          ) : (
+            <Moon className="h-5 w-5 text-muted-foreground" />
+          )}
+        </button>
+      </div>
 
       <Card className="w-full max-w-md shadow-xl border-border/50">
         <CardHeader className="text-center pb-2">
@@ -347,20 +413,14 @@ export default function Login() {
             </div>
           ) : mode === "login" ? (
             <form onSubmit={handleLogin} className="space-y-4">
-              {mobileAuth.isNative && (
-                <div className="space-y-2">
-                  <Label htmlFor="panel-url">面板地址</Label>
-                  <Input
-                    id="panel-url"
-                    type="url"
-                    placeholder="https://panel.example.com"
-                    value={panelUrl}
-                    onChange={(e) => setPanelUrl(e.target.value)}
-                    autoComplete="url"
-                    autoFocus
-                    disabled={isPending}
-                  />
-                </div>
+              {mobileAuth.isNative && !hasMobilePanelUrl && (
+                <button
+                  type="button"
+                  onClick={() => setShowPanelSettings(true)}
+                  className="w-full rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-left text-sm text-amber-700 transition-colors hover:bg-amber-500/15 dark:text-amber-300"
+                >
+                  请先设置面板地址
+                </button>
               )}
               <div className="space-y-2">
                 <Label htmlFor="username">用户名</Label>
@@ -371,7 +431,7 @@ export default function Login() {
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
                   autoComplete="username"
-                  autoFocus={!mobileAuth.isNative}
+                  autoFocus={!mobileAuth.isNative || hasMobilePanelUrl}
                   disabled={isPending}
                 />
               </div>
@@ -431,7 +491,7 @@ export default function Login() {
                 type="submit"
                 className="w-full"
                 size="lg"
-                disabled={isPending}
+                disabled={isPending || !hasMobilePanelUrl}
               >
                 {loginMutation.isPending ? (
                   <>
@@ -495,6 +555,15 @@ export default function Login() {
             </form>
           ) : (
             <form onSubmit={handleRegister} className="space-y-4">
+              {mobileAuth.isNative && !hasMobilePanelUrl && (
+                <button
+                  type="button"
+                  onClick={() => setShowPanelSettings(true)}
+                  className="w-full rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-left text-sm text-amber-700 transition-colors hover:bg-amber-500/15 dark:text-amber-300"
+                >
+                  请先设置面板地址
+                </button>
+              )}
               <div className="space-y-2">
                 <Label htmlFor="reg-username">用户名</Label>
                 <Input
@@ -508,7 +577,7 @@ export default function Login() {
                   }}
                   autoComplete="username"
                   autoFocus
-                  disabled={isPending}
+                  disabled={isPending || !hasMobilePanelUrl}
                 />
               </div>
               <div className="space-y-2">
@@ -537,7 +606,7 @@ export default function Login() {
                     <Button
                       type="button"
                       variant="outline"
-                      disabled={!email.trim() || sendEmailCodeMutation.isPending}
+                      disabled={!hasMobilePanelUrl || !email.trim() || sendEmailCodeMutation.isPending}
                       onClick={() => sendEmailCodeMutation.mutate({ email: email.trim() })}
                     >
                       {sendEmailCodeMutation.isPending ? "发送中" : "发送验证码"}
@@ -611,7 +680,7 @@ export default function Login() {
                   placeholder="请输入计算结果"
                   value={captchaAnswer}
                   onChange={(e) => setCaptchaAnswer(e.target.value)}
-                  disabled={isPending}
+                  disabled={isPending || !hasMobilePanelUrl}
                 />
               </div>
 
@@ -619,7 +688,7 @@ export default function Login() {
                 type="submit"
                 className="w-full"
                 size="lg"
-                disabled={isPending}
+                disabled={isPending || !hasMobilePanelUrl}
               >
                 {registerMutation.isPending ? (
                   <>
@@ -651,6 +720,35 @@ export default function Login() {
           )}
         </CardContent>
       </Card>
+
+      {mobileAuth.isNative && (
+        <Dialog open={showPanelSettings} onOpenChange={setShowPanelSettings}>
+          <DialogContent className="w-[calc(100vw-2rem)] max-w-sm">
+            <DialogTitle>面板地址</DialogTitle>
+            <DialogDescription>验证码、登录和后台请求都会使用这个地址。</DialogDescription>
+            <div className="space-y-2">
+              <Label htmlFor="mobile-panel-url">面板地址</Label>
+              <Input
+                id="mobile-panel-url"
+                type="url"
+                placeholder="http://45.129.9.159:3000"
+                value={panelUrlDraft}
+                onChange={(e) => setPanelUrlDraft(e.target.value)}
+                autoComplete="url"
+                autoFocus
+              />
+            </div>
+            <DialogFooter className="gap-2">
+              <Button className="w-full sm:w-auto" variant="outline" onClick={() => setShowPanelSettings(false)}>
+                取消
+              </Button>
+              <Button className="w-full sm:w-auto" onClick={savePanelUrl}>
+                保存
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
     </div>
   );
 }

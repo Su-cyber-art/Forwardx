@@ -155,7 +155,7 @@ export async function isPortUsedOnHost(hostId: number, sourcePort: number, exclu
   const conds: any[] = [
     eq(forwardRules.hostId, hostId),
     eq(forwardRules.sourcePort, sourcePort),
-    sql`NOT (${forwardRules.isForwardGroupTemplate} = ${true})`,
+    eq(forwardRules.isForwardGroupTemplate, false),
   ];
   if (excludeRuleId) conds.push(sql`${forwardRules.id} != ${excludeRuleId}`);
   const r = await db.select({ count: sql<number>`COUNT(*)` }).from(forwardRules).where(and(...conds));
@@ -171,7 +171,7 @@ export async function findAvailablePort(hostId: number, rangeStart?: number | nu
   // 鑾峰彇璇ヤ富鏈哄凡鍗犵敤鐨勭鍙?
   const usedRows = await db.select({ port: forwardRules.sourcePort }).from(forwardRules).where(and(
     eq(forwardRules.hostId, hostId),
-    sql`NOT (${forwardRules.isForwardGroupTemplate} = ${true})`,
+    eq(forwardRules.isForwardGroupTemplate, false),
   ));
   const usedPorts = new Set(usedRows.map(r => r.port));
   // 闅忔満灏濊瘯

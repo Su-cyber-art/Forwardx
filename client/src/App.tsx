@@ -64,7 +64,7 @@ function Router() {
 
 function SetupGate() {
   const [location] = useLocation();
-  const hasMobilePanelUrl = !mobileAuth.isNative || !!mobileAuth.getPanelUrl();
+  const hasMobilePanelUrl = !mobileAuth.isNative || mobileAuth.hasPanelUrl();
   const setup = trpc.setup.status.useQuery(undefined, {
     enabled: hasMobilePanelUrl,
     retry: false,
@@ -73,6 +73,14 @@ function SetupGate() {
 
   if (!hasMobilePanelUrl) {
     if (location !== "/login") return <Redirect to="/login" />;
+    return <Router />;
+  }
+
+  if (setup.isError) {
+    if (mobileAuth.isNative) {
+      if (location !== "/login") return <Redirect to="/login" />;
+      return <Router />;
+    }
     return <Router />;
   }
 

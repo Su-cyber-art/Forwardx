@@ -4,6 +4,10 @@ const config: CapacitorConfig = {
   appId: 'com.forwardx.app',
   appName: 'ForwardX',
   webDir: 'client/dist',
+  server: {
+    androidScheme: 'http',
+    cleartext: true,
+  },
   android: {
     backgroundColor: '#f7f9fc',
   },

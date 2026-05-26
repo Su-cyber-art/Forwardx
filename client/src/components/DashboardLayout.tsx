@@ -703,7 +703,7 @@ function DashboardLayoutContent({
       </SidebarInset>
 
       <Dialog open={showUpgradeDialog} onOpenChange={setShowUpgradeDialog}>
-        <DialogContent className="sm:max-w-lg">
+        <DialogContent className="w-[calc(100vw-2rem)] max-w-[560px] overflow-x-hidden sm:max-w-xl">
           <DialogTitle className="flex items-center gap-2">
             <Rocket className="h-5 w-5 text-primary" />
             发现新版本
@@ -719,17 +719,16 @@ function DashboardLayoutContent({
             const isError = job?.status === "error";
             const targetVersion = upgradeTargetVersion || "-";
             const currentVersion = upgradeStatus?.currentVersion || updateInfo?.currentVersion || "-";
-            const logs = (job?.logs || []).slice(-24).join("\n");
             return (
-              <div className="space-y-4 py-2">
-                <div className="grid grid-cols-2 gap-3 rounded-lg border border-border/40 bg-muted/20 p-3 text-sm">
-                  <div>
+              <div className="min-w-0 space-y-4 overflow-x-hidden py-2">
+                <div className="grid gap-3 rounded-lg border border-border/40 bg-muted/20 p-3 text-sm sm:grid-cols-2">
+                  <div className="min-w-0">
                     <p className="text-xs text-muted-foreground">当前版本</p>
-                    <p className="mt-1 font-mono">v{currentVersion}</p>
+                    <p className="mt-1 break-all font-mono">v{currentVersion}</p>
                   </div>
-                  <div>
+                  <div className="min-w-0">
                     <p className="text-xs text-muted-foreground">目标版本</p>
-                    <p className="mt-1 font-mono">{String(targetVersion).startsWith("v") ? targetVersion : `v${targetVersion}`}</p>
+                    <p className="mt-1 break-all font-mono">{String(targetVersion).startsWith("v") ? targetVersion : `v${targetVersion}`}</p>
                   </div>
                 </div>
 
@@ -746,17 +745,17 @@ function DashboardLayoutContent({
                       <span className="text-xs text-muted-foreground">{progress.percent}%</span>
                     </div>
                     <Progress value={progress.percent} className="h-2" />
-                    <div className="grid gap-2 sm:grid-cols-2">
+                    <div className="grid min-w-0 gap-2 sm:grid-cols-2">
                       {progress.steps.map((step) => (
-                        <div key={step.label} className="flex items-center gap-2 text-xs">
+                        <div key={step.label} className="flex min-w-0 items-center gap-2 text-xs">
                           {step.done ? (
-                            <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
+                            <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-500" />
                           ) : step.active ? (
-                            <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
+                            <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-primary" />
                           ) : (
-                            <span className="h-3.5 w-3.5 rounded-full border border-border" />
+                            <span className="h-3.5 w-3.5 shrink-0 rounded-full border border-border" />
                           )}
-                          <span className={step.done || step.active ? "text-foreground" : "text-muted-foreground"}>{step.label}</span>
+                          <span className={step.done || step.active ? "truncate text-foreground" : "truncate text-muted-foreground"}>{step.label}</span>
                         </div>
                       ))}
                     </div>
@@ -779,20 +778,15 @@ function DashboardLayoutContent({
                   </div>
                 )}
 
-                {logs && (
-                  <pre className="max-h-40 overflow-auto rounded-lg border border-border/40 bg-muted/30 p-3 text-[11px] leading-5 text-muted-foreground">
-                    {logs}
-                  </pre>
-                )}
               </div>
             );
           })()}
           <DialogFooter className="gap-2">
-            <Button variant="outline" onClick={() => setShowUpgradeDialog(false)}>
+            <Button className="w-full sm:w-auto" variant="outline" onClick={() => setShowUpgradeDialog(false)}>
               {upgradeStatus?.job?.status === "running" ? "后台执行" : "取消"}
             </Button>
             <Button
-              className="gap-2"
+              className="w-full gap-2 sm:w-auto"
               disabled={
                 !upgradeTargetVersion ||
                 upgradeStatus?.upgradeEnabled === false ||

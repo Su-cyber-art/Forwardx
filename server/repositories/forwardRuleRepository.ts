@@ -21,7 +21,7 @@ export async function getForwardRulesForAgent(hostId?: number) {
   const db = await getDb();
   if (!db) return [];
   const conds: any[] = [
-    sql`NOT (${forwardRules.isForwardGroupTemplate} = ${true})`,
+    eq(forwardRules.isForwardGroupTemplate, false),
   ];
   if (hostId) {
     conds.push(eq(forwardRules.hostId, hostId));

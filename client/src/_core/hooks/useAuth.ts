@@ -3,6 +3,7 @@ import { mobileAuth } from "@/lib/mobileAuth";
 
 export function useAuth() {
   const { data: user, isLoading: loading } = trpc.auth.me.useQuery(undefined, {
+    enabled: !mobileAuth.isNative || mobileAuth.hasPanelUrl(),
     retry: false,
     refetchOnWindowFocus: false,
   });

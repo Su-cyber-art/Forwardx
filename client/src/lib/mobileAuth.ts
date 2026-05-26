@@ -36,10 +36,29 @@ function setValue(key: string, value?: string | null) {
   persistNative(key, value);
 }
 
+function normalizePanelUrl(url: string) {
+  return url.trim().replace(/\/+$/, "");
+}
+
+function isValidPanelUrl(url: string) {
+  const normalized = normalizePanelUrl(url);
+  if (!normalized) return false;
+  try {
+    const parsed = new URL(normalized);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 export const mobileAuth = {
   get isNative() {
     return isCapacitorRuntime();
   },
+
+  normalizePanelUrl,
+
+  isValidPanelUrl,
 
   async hydrateNative() {
     if (!isCapacitorRuntime() || typeof window === "undefined") return;
@@ -55,8 +74,12 @@ export const mobileAuth = {
     return getLocalValue(PANEL_URL_KEY);
   },
 
+  hasPanelUrl() {
+    return isValidPanelUrl(getLocalValue(PANEL_URL_KEY));
+  },
+
   setPanelUrl(url: string) {
-    const normalized = url.trim().replace(/\/+$/, "");
+    const normalized = normalizePanelUrl(url);
     setValue(PANEL_URL_KEY, normalized);
   },
 
@@ -95,6 +118,6 @@ export const mobileAuth = {
   trpcUrl() {
     if (!isCapacitorRuntime()) return "/api/trpc";
     const panelUrl = mobileAuth.getPanelUrl();
-    return panelUrl ? `${panelUrl}/api/trpc` : "/api/trpc";
+    return isValidPanelUrl(panelUrl) ? `${normalizePanelUrl(panelUrl)}/api/trpc` : "/api/trpc";
   },
 };

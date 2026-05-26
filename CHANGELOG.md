@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.3.07] - 2026-05-26
+
+### Fixed
+
+- Fixed the upgrade dialog layout overflow and removed detailed command logs from the upgrade modal.
+- Fixed Android HTTP panel login by enabling cleartext traffic for Capacitor builds.
+- Fixed Android login recovery so a failed panel address no longer causes a white screen on the next launch.
+- Fixed SQLite Agent heartbeat errors caused by boolean values being bound directly in raw SQL conditions.
+
+### Changed
+
+- Moved Android panel address configuration into a top-right login setting dialog; captcha, login, and backend requests now use that saved address.
+- Bumped panel version to 2.3.07. Agent version remains 2.2.49.
+
 ## [2.3.06] - 2026-05-26
 
 ### Added
