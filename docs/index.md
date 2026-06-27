@@ -15,7 +15,7 @@ hero:
 
 features:
   - title: 快速部署
-    details: 支持 Docker 和本地 systemd 部署，首次启动后按向导完成数据库和管理员初始化。
+    details: 使用本地二进制包和 systemd 部署，首次启动后按向导完成数据库和管理员初始化。
   - title: 多主机管理
     details: 通过 Agent 管理多台 Linux 服务器，统一查看在线状态、系统资源、入口地址和版本。
   - title: 转发规则

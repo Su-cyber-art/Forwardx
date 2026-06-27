@@ -1,8 +1,0 @@
-node_modules
-dist
-client/dist
-docs
-.env
-.git
-*.md
-!.dockerignore

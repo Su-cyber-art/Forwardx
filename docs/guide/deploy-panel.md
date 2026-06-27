@@ -1,13 +1,13 @@
 # 部署面板
 
-ForwardX 面板支持 Docker 部署和本地 systemd 部署。普通用户优先推荐 Docker 部署。
+当前个人 fork 只保留本地二进制包 + systemd 部署方式。
 
-## Docker 部署
+## 本地 systemd 部署
 
 以 root 用户执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install-panel-docker.sh | bash -s -- install
+curl -fsSL https://raw.githubusercontent.com/Su-cyber-art/Forwardx/main/scripts/install-panel-local.sh | FORWARDX_GITHUB_REPO=Su-cyber-art/Forwardx bash -s -- install
 ```
 
 安装完成后访问：
@@ -18,71 +18,14 @@ http://服务器IP:3000
 
 第一次打开面板时不会直接进入后台，而是进入初始化向导。你需要先选择数据库，再创建管理员账号。
 
-Docker 部署的特点：
-
-- 安装简单。
-- 升级方便。
-- 数据保存在 Docker 数据卷中。
-- 默认使用官方镜像，不需要在服务器上编译项目。
-
 常用命令：
 
 ```bash
 # 升级面板
-curl -fsSL https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install-panel-docker.sh | bash -s -- upgrade
+curl -fsSL https://raw.githubusercontent.com/Su-cyber-art/Forwardx/main/scripts/install-panel-local.sh | FORWARDX_GITHUB_REPO=Su-cyber-art/Forwardx bash -s -- upgrade
 
 # 卸载面板
-curl -fsSL https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install-panel-docker.sh | bash -s -- uninstall
-
-# 查看容器日志
-docker logs -n 300 forwardx-panel
-```
-
-默认部署目录通常是：
-
-```text
-/opt/forwardx-docker
-```
-
-### Docker 外部数据库地址怎么填
-
-如果你在 Docker 或 1Panel 中使用 MySQL/PostgreSQL，数据库地址必须是“面板容器内部能访问到的地址”，不是你电脑浏览器能访问到的地址。
-
-常见填写方式：
-
-| 场景 | 数据库地址建议 |
-| --- | --- |
-| 数据库和面板在同一个 compose 项目网络 | 填数据库服务名，例如 `postgres`、`mysql` |
-| 使用 1Panel 创建的数据库容器 | 填 1Panel 显示的数据库容器服务名，并确认面板容器和数据库容器在同一网络 |
-| 数据库在宿主机上 | Linux 通常填宿主机内网 IP，不建议填 `127.0.0.1` |
-| 数据库在另一台服务器 | 填对方面板服务器可访问的内网 IP、公网 IP 或域名 |
-
-::: warning 注意
-在面板容器里，`127.0.0.1` 指的是面板容器自己，不是宿主机，也不是数据库容器。日志里出现 `getaddrinfo ENOTFOUND xxx` 时，通常表示填写的数据库主机名在面板容器内无法解析。
-:::
-
-## 本地 systemd 部署
-
-如果你不想使用 Docker，可以使用本地部署：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install-panel-local.sh | bash -s -- install
-```
-
-安装完成后访问：
-
-```text
-http://服务器IP:3000
-```
-
-常用命令：
-
-```bash
-# 升级面板
-curl -fsSL https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install-panel-local.sh | bash -s -- upgrade
-
-# 卸载面板
-curl -fsSL https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install-panel-local.sh | bash -s -- uninstall
+curl -fsSL https://raw.githubusercontent.com/Su-cyber-art/Forwardx/main/scripts/install-panel-local.sh | FORWARDX_GITHUB_REPO=Su-cyber-art/Forwardx bash -s -- uninstall
 
 # 查看面板日志
 journalctl -u forwardx-panel -n 300 --no-pager

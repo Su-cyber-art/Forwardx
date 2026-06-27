@@ -36,13 +36,13 @@ function friendlyDatabaseError(error: unknown) {
   if (code === "ENOTFOUND" || /getaddrinfo ENOTFOUND/i.test(raw)) {
     const hostMatch = raw.match(/ENOTFOUND\s+([^\s]+)/i);
     const host = hostname || hostMatch?.[1] || "数据库地址";
-    return `无法解析数据库地址 ${host}。如果面板通过 Docker/1Panel 部署，请确认这个主机名在面板容器内部可解析，或改用数据库容器服务名、同网络容器名、宿主机内网 IP 或可访问的域名。`;
+    return `无法解析数据库地址 ${host}。请确认这个主机名可被面板服务器解析，或改用可访问的 IP 或域名。`;
   }
   if (code === "ECONNREFUSED" || /ECONNREFUSED/i.test(raw)) {
-    return "数据库连接被拒绝。请检查数据库服务是否启动、端口是否正确，以及防火墙或 Docker 网络是否允许面板容器访问。";
+    return "数据库连接被拒绝。请检查数据库服务是否启动、端口是否正确，以及防火墙或安全组是否允许面板访问。";
   }
   if (code === "ETIMEDOUT" || /timeout|timed out/i.test(raw)) {
-    return "数据库连接超时。请检查数据库地址、端口、防火墙、安全组和 Docker 网络。";
+    return "数据库连接超时。请检查数据库地址、端口、防火墙和安全组。";
   }
   if (/password authentication failed|access denied/i.test(raw)) {
     return "数据库账号或密码验证失败，请检查用户名、密码和数据库权限。";

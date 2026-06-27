@@ -37,8 +37,8 @@
 - 教程站点主题升级为玻璃拟态风格，加入动态模糊背景、玻璃卡片、导航和文档内容视觉优化，更适合教程展示。
 - 新增 `docs/public/img` 图片资源目录，后续教程截图可直接通过 `/img/图片名` 引用。
 - 部署教程补充首次进入面板时的数据库选择、连接测试、管理员创建和面板公开地址配置说明。
-- Docker/1Panel 外部数据库说明增强，明确数据库地址必须从面板容器内部可访问，避免把容器内 `127.0.0.1` 误当宿主机数据库地址。
-- Docker 安装脚本优化外部数据库引导，默认提示使用 `host.docker.internal` 访问宿主机数据库，并为 compose 增加 host-gateway 映射。
+- 外部数据库说明增强，明确数据库地址必须从面板服务进程可访问，避免把本机回环地址误当远程数据库地址。
+- 本地安装脚本优化外部数据库引导，默认提示使用可访问的 IP 或域名。
 - 首次安装阶段数据库配置异常时，面板会尽量继续启动初始化页面，并显示更明确的数据库连接错误，方便用户修正数据库地址。
 - 转发规则新增单条规则流量重置，以及当前列表规则批量重置；仅清除规则累计和近 24 小时统计，不清除用户已使用累计值。
 
@@ -604,7 +604,7 @@
 
 ### Fixed
 
-- Improved panel update checks, Docker/runtime version reporting, and release asset readiness checks.
+- Improved panel update checks, runtime version reporting, and release asset readiness checks.
 - Improved forwarding-rule handling around PROXY Protocol and tunnel routes.
 
 ### Changed
@@ -752,7 +752,7 @@
 
 ### Added
 
-- Added database switching and setup support for SQLite, MySQL, and PostgreSQL, including migration helpers and Docker/local install script support.
+- Added database switching and setup support for SQLite, MySQL, and PostgreSQL, including migration helpers and local install script support.
 
 ### Removed
 
@@ -2154,5 +2154,5 @@
 - 多用户权限：管理员/普通用户角色分离，资源隔离
 - 主机监控：CPU、内存、网络、磁盘使用率实时上报
 - 配置导入导出：JSON 格式的规则和主机配置备份与恢复
-- Docker 一键部署：多阶段构建，内置 SQLite
+- 本地二进制部署：systemd 服务，内置 SQLite
 - 暗色主题：亮色/暗色主题切换，跟随系统偏好

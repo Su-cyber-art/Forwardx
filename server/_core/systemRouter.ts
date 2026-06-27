@@ -74,10 +74,7 @@ const ANDROID_APK_DOWNLOAD_URL =
 const UPDATE_CHECK_COOLDOWN_MS = 60 * 1000;
 const UPGRADE_ASSETS_PENDING_EXIT_CODE = 12;
 const MANUAL_LOCAL_UPGRADE_COMMAND =
-  "curl -fsSL https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install-panel-local.sh | sudo bash -s -- upgrade";
-const MANUAL_DOCKER_UPGRADE_COMMAND =
-  "curl -fsSL https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install-panel-docker.sh | sudo bash -s -- upgrade";
-const DEFAULT_DOCKER_IMAGE = "ghcr.io/poouo/forwardx:latest";
+  "curl -fsSL https://raw.githubusercontent.com/Su-cyber-art/Forwardx/main/scripts/install-panel-local.sh | sudo env FORWARDX_GITHUB_REPO=Su-cyber-art/Forwardx bash -s -- upgrade";
 const forwardProtocolSettingsSchema = z.object(
   Object.fromEntries(
     [...FORWARD_TYPES, ...TUNNEL_PROTOCOLS].map((key) => [key, z.boolean().optional()])
@@ -159,8 +156,6 @@ type UpdateInfo = {
 };
 
 type DeploymentInfo = {
-  docker: boolean;
-  dockerSocket: boolean;
   manualUpgradeCommand: string;
 };
 
@@ -359,187 +354,45 @@ async function fetchPanelBundleAssetStatus(version: string): Promise<{ ready: bo
   return { ready: res.ok, status: res.status, url };
 }
 
-function dockerImageReference() {
-  return String(process.env.FORWARDX_IMAGE || DEFAULT_DOCKER_IMAGE).trim() || DEFAULT_DOCKER_IMAGE;
-}
-
-function dockerImageReferenceForVersion(version: string) {
-  const configuredImage = String(process.env.FORWARDX_IMAGE || "").trim();
-  if (configuredImage) return configuredImage;
-  const image = parseDockerImageReference(DEFAULT_DOCKER_IMAGE);
-  return `${image.registry}/${image.repository}:v${normalizeVersion(version)}`;
-}
-
-function parseDockerImageReference(image: string) {
-  const value = image.replace(/^https?:\/\//i, "").split("@")[0];
-  const slashIndex = value.indexOf("/");
-  const registry = slashIndex > 0 ? value.slice(0, slashIndex) : "ghcr.io";
-  const rest = slashIndex > 0 ? value.slice(slashIndex + 1) : value;
-  const lastSlash = rest.lastIndexOf("/");
-  const lastColon = rest.lastIndexOf(":");
-  const hasTag = lastColon > lastSlash;
-  return {
-    registry,
-    repository: hasTag ? rest.slice(0, lastColon) : rest,
-    tag: hasTag ? rest.slice(lastColon + 1) : "latest",
-  };
-}
-
-function parseBearerChallenge(header: string | null) {
-  if (!header || !/^Bearer\s+/i.test(header)) return null;
-  const params: Record<string, string> = {};
-  for (const match of header.matchAll(/(\w+)="([^"]*)"/g)) {
-    params[match[1]] = match[2];
-  }
-  return params.realm ? params : null;
-}
-
-async function fetchRegistryJson<T>(url: string, accept: string, scope: string): Promise<T> {
-  const headers: Record<string, string> = {
-    "Accept": accept,
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "User-Agent": `ForwardX/${APP_VERSION}`,
-  };
-  let res = await fetch(url, { cache: "no-store", headers });
-  if (res.status === 401) {
-    const challenge = parseBearerChallenge(res.headers.get("www-authenticate"));
-    if (challenge?.realm) {
-      const tokenUrl = new URL(challenge.realm);
-      if (challenge.service) tokenUrl.searchParams.set("service", challenge.service);
-      tokenUrl.searchParams.set("scope", challenge.scope || scope);
-      const tokenRes = await fetch(tokenUrl, {
-        cache: "no-store",
-        headers: { "User-Agent": `ForwardX/${APP_VERSION}` },
-      });
-      if (!tokenRes.ok) throw new Error(`Docker 镜像令牌请求失败：${tokenRes.status} ${tokenRes.statusText}`);
-      const tokenData = await tokenRes.json() as { token?: string; access_token?: string };
-      const token = tokenData.token || tokenData.access_token;
-      if (!token) throw new Error("Docker 镜像令牌为空");
-      res = await fetch(url, {
-        cache: "no-store",
-        headers: { ...headers, Authorization: `Bearer ${token}` },
-      });
-    }
-  }
-  if (!res.ok) throw new Error(`Docker 镜像信息请求失败：${res.status} ${res.statusText}`);
-  return res.json() as Promise<T>;
-}
-
-async function fetchDockerImageVersion(imageRef = dockerImageReference()): Promise<string | null> {
-  const image = parseDockerImageReference(imageRef);
-  const scope = `repository:${image.repository}:pull`;
-  const base = `https://${image.registry}/v2/${image.repository}`;
-  const manifestAccept = [
-    "application/vnd.oci.image.index.v1+json",
-    "application/vnd.docker.distribution.manifest.list.v2+json",
-    "application/vnd.oci.image.manifest.v1+json",
-    "application/vnd.docker.distribution.manifest.v2+json",
-  ].join(", ");
-  const manifest = await fetchRegistryJson<any>(`${base}/manifests/${encodeURIComponent(image.tag)}`, manifestAccept, scope);
-  let imageManifest = manifest;
-  if (Array.isArray(manifest.manifests)) {
-    const selected =
-      manifest.manifests.find((item: any) => item?.platform?.os === "linux" && item?.platform?.architecture === "amd64") ||
-      manifest.manifests.find((item: any) => item?.platform?.os === "linux") ||
-      manifest.manifests[0];
-    const digest = selected?.digest;
-    if (!digest) throw new Error("Docker manifest list 中未找到可用镜像 digest");
-    imageManifest = await fetchRegistryJson<any>(`${base}/manifests/${digest}`, manifestAccept, scope);
-  }
-  const configDigest = imageManifest?.config?.digest;
-  if (!configDigest) throw new Error("Docker 镜像配置 digest 为空");
-  const config = await fetchRegistryJson<any>(
-    `${base}/blobs/${configDigest}`,
-    "application/vnd.oci.image.config.v1+json, application/vnd.docker.container.image.v1+json, application/json",
-    scope,
-  );
-  const labels = config?.config?.Labels || config?.container_config?.Labels || {};
-  const envList: string[] = Array.isArray(config?.config?.Env) ? config.config.Env : [];
-  const envVersion = envList.find((item) => item.startsWith("FORWARDX_IMAGE_VERSION="))?.split("=").slice(1).join("=");
-  const labelVersion =
-    labels["org.opencontainers.image.version"] ||
-    labels["org.forwardx.version"] ||
-    labels["io.forwardx.version"];
-  const version = normalizeVersion(labelVersion || envVersion || "");
-  return version || null;
-}
-
 async function ensureUpdateDeployable(info: UpdateInfo): Promise<UpdateInfo> {
   if (!info.latestVersion || !info.hasUpdate) {
     return { ...info, deployable: info.hasUpdate || undefined };
   }
   const expected = normalizeVersion(info.latestVersion);
-  if (!isDockerRuntime()) {
-    try {
-      const asset = await fetchPanelBundleAssetStatus(expected);
-      if (asset.ready) {
-        return { ...info, deployable: true, artifactVersion: `v${expected}`, pendingReason: null };
-      }
-      if (asset.status === 404) {
-        return {
-          ...info,
-          hasUpdate: false,
-          deployable: false,
-          artifactVersion: null,
-          pendingReason: `已发现新版本 v${expected}，但面板安装包 forwardx-panel-v${expected}.tar.gz 尚未上传到 GitHub Release，正在等待 GitHub Actions 构建完成。请稍后重新检查更新。`,
-        };
-      }
-      return {
-        ...info,
-        hasUpdate: false,
-        deployable: false,
-        artifactVersion: null,
-        pendingReason: `已发现新版本 v${expected}，但暂时无法确认面板安装包是否可下载（HTTP ${asset.status}）。请稍后重试。`,
-      };
-    } catch (error: any) {
-      return {
-        ...info,
-        hasUpdate: false,
-        deployable: false,
-        artifactVersion: null,
-        pendingReason: `已发现新版本 v${expected}，但暂时无法确认面板安装包是否构建完成：${error?.message || "未知错误"}`,
-      };
-    }
-  }
-
   try {
-    const imageRef = dockerImageReferenceForVersion(expected);
-    const imageVersion = await fetchDockerImageVersion(imageRef);
-    const artifactVersion = imageVersion ? `v${normalizeVersion(imageVersion)}` : null;
-    if (imageVersion && compareVersions(imageVersion, expected) >= 0) {
-      return { ...info, deployable: true, artifactVersion, pendingReason: null };
+    const asset = await fetchPanelBundleAssetStatus(expected);
+    if (asset.ready) {
+      return { ...info, deployable: true, artifactVersion: `v${expected}`, pendingReason: null };
+    }
+    if (asset.status === 404) {
+      return {
+        ...info,
+        hasUpdate: false,
+        deployable: false,
+        artifactVersion: null,
+        pendingReason: `已发现新版本 v${expected}，但面板安装包 forwardx-panel-v${expected}.tar.gz 尚未上传到 GitHub Release，正在等待 GitHub Actions 构建完成。请稍后重新检查更新。`,
+      };
     }
     return {
       ...info,
+      hasUpdate: false,
       deployable: false,
-      artifactVersion,
-      pendingReason: `已发现新版本 v${expected}，但 Docker 镜像 ${imageRef}${artifactVersion ? ` 当前仍是 ${artifactVersion}` : " 尚未构建完成"}。可先复制一键升级脚本，若镜像未就绪脚本会提示稍后重试。`,
+      artifactVersion: null,
+      pendingReason: `已发现新版本 v${expected}，但暂时无法确认面板安装包是否可下载（HTTP ${asset.status}）。请稍后重试。`,
     };
   } catch (error: any) {
     return {
       ...info,
+      hasUpdate: false,
       deployable: false,
       artifactVersion: null,
-      pendingReason: `已发现新版本 v${expected}，但暂时无法确认 Docker 镜像 ${dockerImageReferenceForVersion(expected)} 是否构建完成：${error?.message || "未知错误"}。可先复制一键升级脚本，若镜像未就绪脚本会提示稍后重试。`,
+      pendingReason: `已发现新版本 v${expected}，但暂时无法确认面板安装包是否构建完成：${error?.message || "未知错误"}`,
     };
   }
 }
 
 async function getUpgradeAssetsPendingReason(targetVersion: string): Promise<string | null> {
   const expected = normalizeVersion(targetVersion);
-  if (isDockerRuntime()) {
-    try {
-      const imageRef = dockerImageReferenceForVersion(expected);
-      const imageVersion = await fetchDockerImageVersion(imageRef);
-      if (imageVersion && compareVersions(imageVersion, expected) >= 0) return null;
-      const artifactVersion = imageVersion ? `v${normalizeVersion(imageVersion)}` : null;
-      return `已发现新版本 v${expected}，但 Docker 镜像 ${imageRef}${artifactVersion ? ` 当前仍是 ${artifactVersion}` : " 尚未构建完成"}，正在等待 GitHub Actions 构建完成。请稍后重试。`;
-    } catch (error: any) {
-      return `已发现新版本 v${expected}，但暂时无法确认 Docker 镜像 ${dockerImageReferenceForVersion(expected)} 是否构建完成：${error?.message || "未知错误"}`;
-    }
-  }
-
   try {
     const asset = await fetchPanelBundleAssetStatus(expected);
     if (asset.ready) return null;
@@ -678,7 +531,6 @@ function normalizeUpgradeCommand(command: string) {
 function appendManualUpgradeHint() {
   appendUpgradeLog("[ForwardX] Automatic upgrade failed. Run a one-click script on the server to upgrade manually:");
   appendUpgradeLog(`[ForwardX] Local: ${MANUAL_LOCAL_UPGRADE_COMMAND}`);
-  appendUpgradeLog(`[ForwardX] Docker: ${MANUAL_DOCKER_UPGRADE_COMMAND}`);
 }
 
 function setUpgradeWaitingForAssets(targetVersion: string, reason: string) {
@@ -804,11 +656,8 @@ export async function startPanelUpgradeTask(targetVersionInput?: string | null) 
 }
 
 function getDeploymentInfo(): DeploymentInfo {
-  const docker = isDockerRuntime();
   return {
-    docker,
-    dockerSocket: fs.existsSync("/var/run/docker.sock"),
-    manualUpgradeCommand: docker ? MANUAL_DOCKER_UPGRADE_COMMAND : MANUAL_LOCAL_UPGRADE_COMMAND,
+    manualUpgradeCommand: MANUAL_LOCAL_UPGRADE_COMMAND,
   };
 }
 
@@ -829,16 +678,12 @@ function normalizePort(value: unknown) {
   return port;
 }
 
-function isDockerRuntime() {
-  return fs.existsSync("/.dockerenv");
-}
-
 function webPortConfigPath() {
   return ENV.portConfigPath.trim() || path.resolve(process.cwd(), ".env");
 }
 
 function canManageWebPort() {
-  return process.platform !== "win32" && !isDockerRuntime();
+  return process.platform !== "win32";
 }
 
 function isTcpPortAvailable(port: number): Promise<boolean> {
@@ -1202,7 +1047,6 @@ function publicSystemSettings(all: Record<string, string | null>, activeProtocol
     webPort: ENV.port,
     webPortManagement: {
       enabled: false,
-      docker: isDockerRuntime(),
     },
     registrationEnabled: all.registrationEnabled !== "false",
     twoFactorEnabled: all.twoFactorEnabled === "true",
@@ -1276,8 +1120,6 @@ function publicSystemSettings(all: Record<string, string | null>, activeProtocol
     agentEncryption: "aes-256-ctr+hmac-sha256",
     upgrade: {
       enabled: false,
-      docker: false,
-      dockerSocket: false,
       commandConfigured: false,
       manualUpgradeCommand: "",
     },
@@ -1355,7 +1197,6 @@ export const systemRouter = router({
       webPort: ENV.port,
       webPortManagement: {
         enabled: canManageWebPort(),
-        docker: isDockerRuntime(),
       },
       registrationEnabled: all.registrationEnabled !== "false",
       twoFactorEnabled: all.twoFactorEnabled === "true",
@@ -1430,8 +1271,6 @@ export const systemRouter = router({
       agentEncryption: "aes-256-ctr+hmac-sha256", // 加密方案标识
       upgrade: {
         enabled: !!ENV.upgradeCommand.trim(),
-        docker: getDeploymentInfo().docker,
-        dockerSocket: getDeploymentInfo().dockerSocket,
         commandConfigured: !!ENV.upgradeCommand.trim(),
         manualUpgradeCommand: getDeploymentInfo().manualUpgradeCommand,
       },
@@ -1921,7 +1760,7 @@ export const systemRouter = router({
     .input(z.object({ port: z.number().int().min(1).max(65535), confirmed: z.literal(true) }))
     .mutation(async ({ input }) => {
       if (!canManageWebPort()) {
-        throw new Error("Docker 部署不支持在后台修改 Web 端口，请自行配置端口映射");
+        throw new Error("当前环境不支持在后台修改 Web 端口，请在服务器环境配置中修改后重启服务");
       }
       const port = normalizePort(input.port);
       const currentPort = normalizePort(ENV.port || 3000);

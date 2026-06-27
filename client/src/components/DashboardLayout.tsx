@@ -103,8 +103,6 @@ const adminMenuItems: SidebarNavItem[] = [
 const PANEL_UPGRADE_SESSION_KEY = "forwardx.panel.upgrade";
 const PANEL_UPGRADE_SESSION_TTL_MS = 2 * 60 * 60 * 1000;
 const MOBILE_APP_UPDATE_SESSION_KEY = "forwardx.mobile.updateNotice";
-const DEFAULT_DOCKER_UPGRADE_COMMAND =
-  "curl -fsSL https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install-panel-docker.sh | sudo bash -s -- upgrade";
 
 type PanelUpgradeSession = { targetVersion: string; startedAt: number };
 
@@ -168,7 +166,6 @@ function getLayoutUpgradeProgress(job: any) {
         /still building/i,
         /发布资产/i,
         /构建完成/i,
-        /Docker image/i,
         /panel bundle/i,
       ]),
     },
@@ -187,7 +184,7 @@ function getLayoutUpgradeProgress(job: any) {
         /Lockfile is up to date/i,
       ]),
     },
-    { label: "安装并重启", done: matched([/Container .* (Creating|Created|Starting|Started)/i, /docker compose up/i, /systemctl restart/i, /已启动/i, /recreate/i]) },
+    { label: "安装并重启", done: matched([/systemctl restart/i, /已启动/i, /recreate/i]) },
   ];
 
   if (status === "success") {
@@ -785,8 +782,6 @@ function DashboardLayoutContent({
   const upgradeProgress = getLayoutUpgradeProgress(displayUpgradeJob);
   const upgradeTargetVersion = updateInfo?.latestVersion || upgradeStatus?.update?.latestVersion || displayUpgradeJob?.targetVersion || "";
   const upgradeChangelogUrl = getPanelChangelogUrl(upgradeTargetVersion, updateInfo?.releaseUrl || upgradeStatus?.update?.releaseUrl);
-  const isDockerDeployment = !!upgradeStatus?.docker;
-  const dockerUpgradeCommand = upgradeStatus?.manualUpgradeCommand || DEFAULT_DOCKER_UPGRADE_COMMAND;
   const upgradeRefreshText = upgradeRefreshCountdown !== null
     ? (upgradeRefreshCountdown > 0 ? `${upgradeRefreshCountdown} 秒后自动刷新` : "正在刷新页面")
     : "系统恢复后将自动刷新";
@@ -1167,36 +1162,6 @@ function DashboardLayoutContent({
             {children}
           </div>
         </main>
-        <footer className="pb-4 text-center text-xs text-muted-foreground">
-          <div className="inline-flex flex-wrap items-center justify-center gap-x-3 gap-y-1">
-            <a
-              href={publicInfo?.repoUrl || "https://github.com/poouo/Forwardx"}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="transition-colors hover:text-foreground"
-            >
-              项目地址
-            </a>
-            <span className="text-muted-foreground/45">|</span>
-            <a
-              href={publicInfo?.telegramBotUrl || "https://t.me/miyin_private_bot"}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="transition-colors hover:text-foreground"
-            >
-              联系TG
-            </a>
-            <span className="text-muted-foreground/45">|</span>
-            <a
-              href="https://t.me/ForwardX_panel"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="transition-colors hover:text-foreground"
-            >
-              TG群组
-            </a>
-          </div>
-        </footer>
       </SidebarInset>
 
       <Dialog open={showUpgradeDialog} onOpenChange={setShowUpgradeDialog}>
@@ -1206,7 +1171,7 @@ function DashboardLayoutContent({
             发现新版本
           </DialogTitle>
           <DialogDescription>
-            {isDockerDeployment ? "复制一键脚本后在服务器执行，脚本会重建 ForwardX 容器。" : "后台升级，完成后自动重启。"}
+            后台升级，完成后自动重启。
           </DialogDescription>
           {(() => {
             const job = displayUpgradeJob;
@@ -1232,20 +1197,7 @@ function DashboardLayoutContent({
 
                 {upgradeStatus?.upgradeEnabled === false && (
                   <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-700 dark:text-amber-300">
-                    {isDockerDeployment ? "Docker 部署请复制下方一键脚本到服务器执行升级。" : "当前环境未配置自动升级命令，无法在面板内一键升级。"}
-                  </div>
-                )}
-
-                {isDockerDeployment && (
-                  <div className="space-y-3 rounded-lg border border-border/40 bg-background/60 p-3">
-                    {updateInfo?.pendingReason && !updateInfo.error && (
-                      <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs leading-5 text-amber-700 dark:text-amber-300">
-                        {updateInfo.pendingReason}
-                      </div>
-                    )}
-                    <code className="block max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-lg border bg-muted/30 p-3 font-mono text-xs leading-relaxed">
-                      {dockerUpgradeCommand}
-                    </code>
+                    当前环境未配置自动升级命令，无法在面板内一键升级。
                   </div>
                 )}
 
@@ -1280,7 +1232,7 @@ function DashboardLayoutContent({
                       发布资产构建中
                     </div>
                     <p className="mt-2 break-words text-xs leading-5">
-                      {job?.error || "GitHub Actions 正在生成面板安装包或 Docker 镜像，请稍后重新检查更新。"}
+                      {job?.error || "GitHub Actions 正在生成面板安装包，请稍后重新检查更新。"}
                     </p>
                   </div>
                 )}
@@ -1314,31 +1266,24 @@ function DashboardLayoutContent({
             <Button className="w-full sm:w-auto" variant="outline" onClick={() => setShowUpgradeDialog(false)}>
               {displayUpgradeJob?.status === "running" ? "后台执行" : "取消"}
             </Button>
-            {isDockerDeployment ? (
-              <Button className="w-full gap-2 sm:w-auto" onClick={() => copyText(dockerUpgradeCommand)}>
-                <Copy className="h-4 w-4" />
-                复制脚本
-              </Button>
-            ) : (
-              <Button
-                className="w-full gap-2 sm:w-auto"
-                disabled={
-                  !upgradeTargetVersion ||
-                  upgradeStatus?.upgradeEnabled === false ||
-                  displayUpgradeJob?.status === "running" ||
-                  displayUpgradeJob?.status === "success" ||
-                  startUpgradeMutation.isPending
-                }
-                onClick={() => upgradeTargetVersion && startUpgradeMutation.mutate({ targetVersion: upgradeTargetVersion })}
-              >
-                {startUpgradeMutation.isPending || displayUpgradeJob?.status === "running" ? (
-                  <Loader2 className="forwardx-icon-spin h-4 w-4" />
-                ) : (
-                  <Rocket className="h-4 w-4" />
-                )}
-                {displayUpgradeJob?.status === "running" ? "升级中..." : "确认升级"}
-              </Button>
-            )}
+            <Button
+              className="w-full gap-2 sm:w-auto"
+              disabled={
+                !upgradeTargetVersion ||
+                upgradeStatus?.upgradeEnabled === false ||
+                displayUpgradeJob?.status === "running" ||
+                displayUpgradeJob?.status === "success" ||
+                startUpgradeMutation.isPending
+              }
+              onClick={() => upgradeTargetVersion && startUpgradeMutation.mutate({ targetVersion: upgradeTargetVersion })}
+            >
+              {startUpgradeMutation.isPending || displayUpgradeJob?.status === "running" ? (
+                <Loader2 className="forwardx-icon-spin h-4 w-4" />
+              ) : (
+                <Rocket className="h-4 w-4" />
+              )}
+              {displayUpgradeJob?.status === "running" ? "升级中..." : "确认升级"}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

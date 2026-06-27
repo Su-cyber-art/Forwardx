@@ -1,15 +1,9 @@
 # 升级和备份
 
-## Docker 升级
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install-panel-docker.sh | bash -s -- upgrade
-```
-
 ## systemd 升级
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install-panel-local.sh | bash -s -- upgrade
+curl -fsSL https://raw.githubusercontent.com/Su-cyber-art/Forwardx/main/scripts/install-panel-local.sh | FORWARDX_GITHUB_REPO=Su-cyber-art/Forwardx bash -s -- upgrade
 ```
 
 ## 升级前建议
@@ -21,8 +15,6 @@ SQLite 本地部署常见备份：
 ```bash
 cp /opt/forwardx-panel/data/forwardx.db /root/forwardx.db.bak
 ```
-
-Docker 部署建议备份 Docker 数据卷，或先导出数据库。
 
 MySQL：
 
@@ -51,4 +43,3 @@ journalctl -u forwardx-agent -n 300 --no-pager
 ## 更新日志
 
 升级前建议查看 GitHub Release 或项目更新日志，确认是否包含面板、Agent 或 Android 客户端更新。
-

@@ -4,10 +4,10 @@
 
 ## 1. 部署面板
 
-普通用户推荐 Docker 部署：
+当前个人 fork 只保留本地二进制包 + systemd 部署方式。以 root 用户执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install-panel-docker.sh | bash -s -- install
+curl -fsSL https://raw.githubusercontent.com/Su-cyber-art/Forwardx/main/scripts/install-panel-local.sh | FORWARDX_GITHUB_REPO=Su-cyber-art/Forwardx bash -s -- install
 ```
 
 安装完成后访问：
@@ -15,8 +15,6 @@ curl -fsSL https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install
 ```text
 http://服务器IP:3000
 ```
-
-如果你不使用 Docker，可以看 [部署面板](./deploy-panel.md) 中的本地 systemd 部署方式。
 
 ## 2. 初始化面板
 
@@ -29,8 +27,6 @@ http://服务器IP:3000
 5. 在系统设置中填写面板公开地址。
 
 不确定数据库怎么选时，先用 SQLite。
-
-如果使用 Docker 并选择 MySQL/PostgreSQL，数据库地址要填写面板容器内部能访问到的地址。日志中出现 `getaddrinfo ENOTFOUND` 时，通常是数据库主机名在容器内解析不到。
 
 ## 3. 创建 Agent Token
 

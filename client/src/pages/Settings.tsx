@@ -95,7 +95,6 @@ function getUpgradeProgress(job: any) {
         /still building/i,
         /发布资产/i,
         /构建完成/i,
-        /Docker image/i,
         /panel bundle/i,
       ]),
     },
@@ -103,9 +102,6 @@ function getUpgradeProgress(job: any) {
       label: "下载或拉取资产",
       done: matched([
         /Downloading panel bundle/i,
-        /Pulling image/i,
-        /Downloaded newer image/i,
-        /Image is up to date/i,
         /load metadata/i,
         /load build context/i,
         /transferring context/i,
@@ -117,10 +113,7 @@ function getUpgradeProgress(job: any) {
         /Lockfile is up to date/i,
       ]),
     },
-    {
-      label: "安装并重启",
-      done: matched([/Container .* (Creating|Created|Starting|Started)/i, /docker compose up/i, /systemctl restart/i, /已启动/i, /recreate/i]),
-    },
+    { label: "安装并重启", done: matched([/systemctl restart/i, /已启动/i, /recreate/i]) },
   ];
 
   if (status === "success") {
@@ -143,10 +136,8 @@ function getUpgradeProgress(job: any) {
   return { percent: 0, label: "等待升级", steps: steps.map((step) => ({ ...step, active: false })) };
 }
 
-const panelLocalScriptUrl = "https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install-panel-local.sh";
-const panelDockerScriptUrl = "https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install-panel-docker.sh";
-const panelLocalCommandPrefix = `curl -fsSL ${panelLocalScriptUrl} | sudo bash -s --`;
-const panelDockerCommandPrefix = `curl -fsSL ${panelDockerScriptUrl} | sudo bash -s --`;
+const panelLocalScriptUrl = "https://raw.githubusercontent.com/Su-cyber-art/Forwardx/main/scripts/install-panel-local.sh";
+const panelLocalCommandPrefix = `curl -fsSL ${panelLocalScriptUrl} | sudo env FORWARDX_GITHUB_REPO=Su-cyber-art/Forwardx bash -s --`;
 const defaultGithubAcceleratorUrl = "https://git.poouo.com";
 type AiProvider = "deepseek" | "siliconflow" | "custom";
 const aiProviderOptions: Array<{ value: AiProvider; label: string }> = [
@@ -231,7 +222,7 @@ function isDdnsProvider(value: unknown): value is DdnsProvider {
 
 const panelInstallGuideCommands = [
   {
-    label: "本地部署",
+    label: "本地二进制部署",
     description: "适合直接在 Linux 主机上运行面板，脚本会下载 GitHub Release 中已构建好的面板程序包，安装运行依赖、写入 systemd 服务并启动面板。",
     directory: "/opt/forwardx-panel",
     service: "forwardx-panel",
@@ -241,27 +232,12 @@ const panelInstallGuideCommands = [
     versionedUpgrade: `curl -fsSL ${panelLocalScriptUrl} | sudo env FORWARDX_TARGET_VERSION=vX.Y.Z bash -s -- upgrade`,
     notes: ["默认 Web 端口为 3000，安装时可按提示修改。", "升级会保留 .env、data 目录、数据库配置和已有数据。", "如果面板程序包尚未上传到 Release，脚本会提示等待 GitHub Actions 构建完成。"],
   },
-  {
-    label: "Docker 部署",
-    description: "适合使用 Docker Compose 管理面板，脚本会安装 Docker、拉取 GitHub Packages 预编译镜像并启动容器。",
-    directory: "/opt/forwardx-docker",
-    service: "forwardx-panel 容器",
-    install: `${panelDockerCommandPrefix} install`,
-    upgrade: `${panelDockerCommandPrefix} upgrade`,
-    uninstall: `${panelDockerCommandPrefix} uninstall`,
-    versionedUpgrade: `curl -fsSL ${panelDockerScriptUrl} | sudo env FORWARDX_TARGET_VERSION=vX.Y.Z bash -s -- upgrade`,
-    notes: ["默认映射 Web 端口为 3000，可通过 PORT 环境变量指定。", "升级会保留 .env、部署目录 data 数据和 Docker 数据卷。", "如果 latest 镜像尚未构建到目标版本，脚本会提示稍后重试并保留旧容器运行。"],
-  },
 ] as const;
 
 const manualPanelUpgradeCommands = [
   {
-    label: "本地部署",
+    label: "本地二进制部署",
     command: panelInstallGuideCommands[0].upgrade,
-  },
-  {
-    label: "Docker 部署",
-    command: panelInstallGuideCommands[1].upgrade,
   },
 ];
 
@@ -688,7 +664,7 @@ function SettingsContent() {
               <div className="space-y-3">
                 <p className="text-sm font-medium">面板部署流程</p>
                 <div className="grid gap-3 sm:grid-cols-4">
-                  {["选择本地部署或 Docker 部署", "在服务器用 root 权限执行安装命令", "打开面板完成初始化配置", "后续使用升级命令更新面板"].map((step, i) => (
+                  {["使用本地二进制部署", "在服务器用 root 权限执行安装命令", "打开面板完成初始化配置", "后续使用升级命令更新面板"].map((step, i) => (
                     <div key={i} className="flex gap-3 items-start">
                       <span className="h-6 w-6 rounded-full bg-primary/10 text-primary flex items-center justify-center text-xs font-bold shrink-0 mt-0.5">
                         {i + 1}
@@ -728,7 +704,7 @@ function SettingsContent() {
                 </ul>
               </div>
 
-              <div className="grid gap-4 lg:grid-cols-2">
+              <div className="grid gap-4">
                 {panelInstallGuideCommands.map((guide) => (
                   <div key={guide.label} className="rounded-lg border border-border/30 bg-muted/20 p-4">
                     <div className="mb-4 flex items-start justify-between gap-3">
@@ -812,9 +788,9 @@ function SettingsContent() {
                 <p className="text-xs text-amber-400 font-medium mb-1">注意事项</p>
                 <ul className="text-xs text-muted-foreground space-y-1">
                   <li>- 安装和升级需要 root 权限。</li>
-                  <li>- 本地部署会自动配置 systemd 服务；Docker 部署会使用 Docker Compose 启动容器。</li>
-                  <li>- 本地部署可通过 FORWARDX_TARGET_VERSION 指定 tag 或版本号；Docker 部署统一拉取 latest 镜像并校验目标版本。</li>
-                  <li>- 卸载命令只有输入 y 后才会删除部署目录或 Docker 数据卷，删除前请确认已经备份数据。</li>
+                  <li>- 本地二进制部署会自动配置 systemd 服务。</li>
+                  <li>- 可通过 FORWARDX_TARGET_VERSION 指定 tag 或版本号。</li>
+                  <li>- 卸载命令只有输入 y 后才会删除部署目录，删除前请确认已经备份数据。</li>
                 </ul>
               </div>
             </CardContent>
@@ -3411,9 +3387,7 @@ function SystemInfoSection() {
   const [savingSetting, setSavingSetting] = useState<SystemSettingsSaveKey | null>(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [showUpgradeConfirm, setShowUpgradeConfirm] = useState(false);
-  const [showDockerUpgradeScript, setShowDockerUpgradeScript] = useState(false);
   const previousUpgradeStatus = useRef<string | null>(null);
-  const shownDockerUpgradeVersion = useRef<string | null>(null);
   const lastPanelUpdateCheck = useRef(0);
 
   useEffect(() => {
@@ -3818,45 +3792,8 @@ function SystemInfoSection() {
 
   const updateInfo = upgradeStatus?.update;
   const upgradeEnabled = !!upgradeStatus?.upgradeEnabled;
-  const isDockerDeployment = !!upgradeStatus?.docker || !!settings?.upgrade?.docker;
   const upgradeChangelogUrl = getPanelChangelogUrl(updateInfo?.latestVersion || upgradeStatus?.currentVersion || settings?.version, updateInfo?.releaseUrl);
-  const dockerPanelUpgradeCommand =
-    upgradeStatus?.manualUpgradeCommand ||
-    settings?.upgrade?.manualUpgradeCommand ||
-    manualPanelUpgradeCommands[1].command;
-  const canShowDockerUpgradeScript =
-    isDockerDeployment &&
-    !!updateInfo?.latestVersion &&
-    (updateInfo.hasUpdate || (!!updateInfo.pendingReason && !updateInfo.error));
-  const canStartPanelUpgrade =
-    isDockerDeployment ? canShowDockerUpgradeScript : !!updateInfo?.hasUpdate;
-  const androidApkDownloadUrl = settings?.androidApkDownloadUrl || "";
-  const contactLinks = [
-    {
-      label: "GitHub 仓库",
-      url: settings?.repoUrl || "#",
-      icon: Github,
-      iconClassName: "",
-    },
-    {
-      label: "Telegram 双向消息机器人",
-      url: settings?.telegramBotUrl || "#",
-      icon: Send,
-      iconClassName: "text-sky-500",
-    },
-    {
-      label: "Telegram 群组",
-      url: "https://t.me/ForwardX_panel",
-      icon: UserPlus,
-      iconClassName: "text-blue-500",
-    },
-    ...(androidApkDownloadUrl ? [{
-      label: "Android APK 下载",
-      url: androidApkDownloadUrl,
-      icon: Download,
-      iconClassName: "text-emerald-600",
-    }] : []),
-  ];
+  const canStartPanelUpgrade = !!updateInfo?.hasUpdate;
   const isUpgradeRunning = upgradeStatus?.job.status === "running";
   const upgradeProgress = getUpgradeProgress(upgradeStatus?.job);
   const upgradeErrorLogs = (upgradeStatus?.job?.logs || []).slice(-80).join("\n");
@@ -3869,13 +3806,6 @@ function SystemInfoSection() {
   const panelSslPemActive = panelSslMode === "pem";
   const panelSslPathConfigured = !!panelSslCertPath.trim() && !!panelSslKeyPath.trim();
   const panelSslPemConfigured = !!panelSslCertPem.trim() && !!panelSslKeyPem.trim();
-
-  useEffect(() => {
-    if (!canShowDockerUpgradeScript || !updateInfo?.latestVersion) return;
-    if (shownDockerUpgradeVersion.current === updateInfo.latestVersion) return;
-    shownDockerUpgradeVersion.current = updateInfo.latestVersion;
-    setShowDockerUpgradeScript(true);
-  }, [canShowDockerUpgradeScript, updateInfo?.latestVersion]);
 
   if (isLoading) {
     return (
@@ -3976,7 +3906,7 @@ function SystemInfoSection() {
               留空使用当前访问地址。需以 http:// 或 https:// 开头。
             </p>
             <p className="text-xs leading-relaxed text-amber-600 dark:text-amber-300">
-              如果通过 HTTPS 反代、Cloudflare 或域名访问面板，请填写外部可访问的 https:// 域名。留空时面板只能根据请求头推断地址，Docker/反代环境可能生成 http://容器地址:端口，导致 Agent 通讯地址被覆盖后离线。
+              如果通过 HTTPS 反代、Cloudflare 或域名访问面板，请填写外部可访问的 https:// 域名。留空时面板只能根据请求头推断地址，反代环境可能生成内网地址，导致 Agent 通讯地址被覆盖后离线。
             </p>
           </CardContent>
         </Card>
@@ -4016,9 +3946,9 @@ function SystemInfoSection() {
             {!settings?.webPortManagement?.enabled && (
               <Alert>
                 <AlertTriangle className="h-4 w-4" />
-                <AlertTitle>Docker 部署不支持后台修改端口</AlertTitle>
+                <AlertTitle>当前环境不支持后台修改端口</AlertTitle>
                 <AlertDescription>
-                  Docker 用户请自行配置端口映射；非 Docker 部署可在此修改监听端口。
+                  请在服务器环境配置中修改端口后重启 forwardx-panel 服务。
                 </AlertDescription>
               </Alert>
             )}
@@ -4617,11 +4547,9 @@ function SystemInfoSection() {
           {!upgradeEnabled && (
             <Alert>
               <AlertTriangle className="h-4 w-4" />
-              <AlertTitle>{isDockerDeployment ? "Docker 部署请使用一键升级脚本" : "当前环境尚未启用一键升级"}</AlertTitle>
+              <AlertTitle>当前环境尚未启用一键升级</AlertTitle>
               <AlertDescription>
-                {isDockerDeployment
-                  ? "检查到新版本后可复制脚本到服务器执行，脚本会覆盖原有 ForwardX 容器。"
-                  : <>配置 <code>FORWARDX_UPGRADE_COMMAND</code> 后可一键升级。</>}
+                配置 <code>FORWARDX_UPGRADE_COMMAND</code> 后可一键升级。
               </AlertDescription>
             </Alert>
           )}
@@ -4676,21 +4604,17 @@ function SystemInfoSection() {
                   toast.error("请先检查更新");
                   return;
                 }
-                if (isDockerDeployment) {
-                  setShowDockerUpgradeScript(true);
-                  return;
-                }
                 if (!upgradeEnabled) {
                   toast.error("未配置升级命令，无法自动升级");
                   return;
                 }
                 setShowUpgradeConfirm(true);
               }}
-              disabled={!canStartPanelUpgrade || (!upgradeEnabled && !isDockerDeployment) || isUpgradeRunning || startUpgradeMutation.isPending}
+              disabled={!canStartPanelUpgrade || !upgradeEnabled || isUpgradeRunning || startUpgradeMutation.isPending}
               className="gap-2"
             >
               <Rocket className="h-4 w-4" />
-              {isDockerDeployment ? "查看升级脚本" : "升级并重启"}
+              升级并重启
             </Button>
             <Button variant="ghost" asChild className="gap-2">
               <a href={upgradeChangelogUrl} target="_blank" rel="noopener noreferrer">
@@ -4728,7 +4652,7 @@ function SystemInfoSection() {
                       {upgradeStatus.job.status === "success"
                         ? "升级成功"
                         : upgradeStatus.job.status === "waiting_assets"
-                          ? "发布资产构建中"
+                        ? "发布资产构建中"
                         : upgradeStatus.job.status === "error"
                           ? "升级出现异常"
                           : "正在升级"}
@@ -4737,7 +4661,7 @@ function SystemInfoSection() {
                       {upgradeStatus.job.status === "success"
                         ? `已完成 ${upgradeStatus.job.targetVersion || ""} 升级，${PANEL_UPGRADE_REFRESH_DELAY_SECONDS} 秒后自动刷新`
                         : upgradeStatus.job.status === "waiting_assets"
-                          ? "GitHub Actions 仍在生成面板安装包或镜像，请稍后重新检查更新"
+                          ? "GitHub Actions 仍在生成面板安装包，请稍后重新检查更新"
                         : upgradeStatus.job.status === "error"
                           ? "升级未完成，请查看下方异常信息"
                           : upgradeProgress.label}
@@ -4908,93 +4832,6 @@ function SystemInfoSection() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={showDockerUpgradeScript} onOpenChange={setShowDockerUpgradeScript}>
-        <DialogContent className="max-w-[calc(100vw-2rem)] sm:max-w-2xl">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <Rocket className="h-5 w-5 text-primary" />
-              Docker 一键升级脚本
-            </DialogTitle>
-            <DialogDescription>
-              检测到新版本 {updateInfo?.latestVersion || ""}，请在服务器执行以下命令升级 Docker 部署。
-            </DialogDescription>
-          </DialogHeader>
-          {updateInfo?.pendingReason && !updateInfo.error && updateInfo.deployable === false && (
-            <Alert>
-              <AlertTriangle className="h-4 w-4" />
-              <AlertTitle>Docker 镜像可能仍在构建</AlertTitle>
-              <AlertDescription>{updateInfo.pendingReason}</AlertDescription>
-            </Alert>
-          )}
-          <Alert>
-            <AlertTriangle className="h-4 w-4" />
-            <AlertTitle>升级会重建原有 ForwardX 容器</AlertTitle>
-            <AlertDescription>
-              脚本会复用当前部署目录的 .env 配置，只重建容器，不删除 Docker 数据卷；原有数据库和 /data 数据会保留。
-            </AlertDescription>
-          </Alert>
-          <code className="block max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-lg border bg-muted/30 p-3 font-mono text-xs leading-relaxed">
-            {dockerPanelUpgradeCommand}
-          </code>
-          <DialogFooter className="gap-2">
-            <Button variant="outline" onClick={() => setShowDockerUpgradeScript(false)}>
-              关闭
-            </Button>
-            <Button className="gap-2" onClick={() => copyTextToClipboard(dockerPanelUpgradeCommand)}>
-              <Copy className="h-4 w-4" />
-              复制脚本
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Card className="border-border/40 bg-card/60 backdrop-blur-md">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-base">
-            <Settings2 className="h-4 w-4 text-primary" />
-            开源与联系
-          </CardTitle>
-          <CardDescription>
-            项目地址与联系渠道。
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <div className="grid gap-3 sm:grid-cols-2">
-            {contactLinks.map((item) => {
-              const Icon = item.icon;
-              return (
-                <a
-                  key={item.label}
-                  href={item.url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="flex min-w-0 items-center justify-between rounded-lg border border-border/40 p-3 transition-colors hover:bg-accent/40"
-                >
-                  <div className="flex min-w-0 items-center gap-3">
-                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted/50">
-                      <Icon className={`h-4 w-4 ${item.iconClassName}`} />
-                    </div>
-                    <div className="min-w-0">
-                      <p className="truncate text-sm font-medium">{item.label}</p>
-                      <p className="truncate font-mono text-xs text-muted-foreground">{item.url}</p>
-                    </div>
-                  </div>
-                  <ExternalLink className="ml-2 h-4 w-4 shrink-0 text-muted-foreground" />
-                </a>
-              );
-            })}
-          </div>
-
-          <div className="flex items-center justify-between text-xs text-muted-foreground pt-2">
-            <span>当前版本</span>
-            <code className="font-mono">v{settings?.version}</code>
-          </div>
-          <div className="flex items-center justify-between text-xs text-muted-foreground">
-            <span>Android APP</span>
-            <code className="font-mono">v{settings?.androidAppVersion}</code>
-          </div>
-        </CardContent>
-      </Card>
     </div>
   );
 }

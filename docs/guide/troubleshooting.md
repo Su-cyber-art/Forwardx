@@ -5,13 +5,6 @@
 检查：
 
 ```bash
-docker ps
-docker logs -n 300 forwardx-panel
-```
-
-或：
-
-```bash
 systemctl status forwardx-panel
 journalctl -u forwardx-panel -n 300 --no-pager
 ```
@@ -22,7 +15,6 @@ journalctl -u forwardx-panel -n 300 --no-pager
 - 端口没有放行。
 - 反向代理配置错误。
 - 数据库连接失败。
-- Docker 镜像没有拉取成功。
 
 ## Agent 离线
 
@@ -113,7 +105,7 @@ ip6tables -t nat -S
 
 如果转发能通但状态异常，重点看流量统计规则是否存在、计数是否增长。
 
-## Docker 升级后 Agent 全部离线
+## 升级后 Agent 全部离线
 
 优先检查：
 
