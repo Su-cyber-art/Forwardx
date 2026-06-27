@@ -2,7 +2,7 @@
 
 当前个人 fork 只保留本地二进制包 + systemd 部署方式。
 
-## 本地 systemd 部署
+## 本地 systemd 一键部署
 
 以 root 用户执行：
 
@@ -24,6 +24,9 @@ http://服务器IP:3000
 # 升级面板
 curl -fsSL https://raw.githubusercontent.com/Su-cyber-art/Forwardx/main/scripts/install-panel-local.sh | FORWARDX_GITHUB_REPO=Su-cyber-art/Forwardx bash -s -- upgrade
 
+# 指定版本升级
+curl -fsSL https://raw.githubusercontent.com/Su-cyber-art/Forwardx/main/scripts/install-panel-local.sh | FORWARDX_GITHUB_REPO=Su-cyber-art/Forwardx FORWARDX_TARGET_VERSION=vX.Y.Z bash -s -- upgrade
+
 # 卸载面板
 curl -fsSL https://raw.githubusercontent.com/Su-cyber-art/Forwardx/main/scripts/install-panel-local.sh | FORWARDX_GITHUB_REPO=Su-cyber-art/Forwardx bash -s -- uninstall
 
@@ -38,6 +41,90 @@ journalctl -u forwardx-panel -n 300 --no-pager
 ```
 
 如需卸载本地面板，请先阅读 [卸载 ForwardX](./uninstall.md)，确认是否保留安装目录和数据库。
+
+## 本地 systemd 手动部署
+
+本地手动部署适合不想执行一键脚本的用户。建议直接使用当前 fork GitHub Release 中的面板安装包，不建议普通用户在服务器上从源码编译。
+
+### 1. 准备 Node.js 和 pnpm
+
+ForwardX 面板需要 Node.js 22 或以上版本。
+
+Ubuntu/Debian 示例：
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+apt-get install -y nodejs curl tar gzip
+corepack enable
+corepack prepare pnpm@10.28.1 --activate
+node -v
+pnpm -v
+```
+
+如果你使用 CentOS、AlmaLinux、Rocky Linux、Debian 旧版本或其他系统，只要最终 `node -v` 是 22 或以上，`pnpm -v` 能正常输出即可。
+
+### 2. 下载面板安装包
+
+把 `VERSION` 改成 GitHub Releases 中的最新版本号：
+
+```bash
+VERSION=v2.3.188
+mkdir -p /opt/forwardx-panel
+cd /opt/forwardx-panel
+curl -fL "https://github.com/Su-cyber-art/Forwardx/releases/download/${VERSION}/forwardx-panel-${VERSION}.tar.gz" -o /tmp/forwardx-panel.tar.gz
+tar -xzf /tmp/forwardx-panel.tar.gz -C /opt/forwardx-panel
+```
+
+如果安装包内包含依赖补丁目录，保持 `patches` 目录和 `package.json` 在同一安装目录下。
+
+### 3. 安装运行依赖
+
+```bash
+cd /opt/forwardx-panel
+pnpm install --prod --frozen-lockfile
+```
+
+### 4. 写入环境变量
+
+```bash
+cat > /opt/forwardx-panel/.env <<'EOF'
+NODE_ENV=production
+PORT=3000
+JWT_SECRET=请替换为随机字符串
+DATABASE_CONFIG_PATH=/opt/forwardx-panel/data/database.json
+SQLITE_PATH=/opt/forwardx-panel/data/forwardx.db
+FORWARDX_PORT_CONFIG_PATH=/opt/forwardx-panel/.env
+FORWARDX_PORT_MANAGEMENT=local
+FORWARDX_UPGRADE_COMMAND=/bin/bash /opt/forwardx-panel/scripts/install-panel-local.sh upgrade
+EOF
+```
+
+更多环境变量见 [环境变量](./env-vars.md)。
+
+### 5. 写入 systemd 服务
+
+```bash
+cat > /etc/systemd/system/forwardx-panel.service <<'EOF'
+[Unit]
+Description=ForwardX Panel
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/forwardx-panel
+EnvironmentFile=/opt/forwardx-panel/.env
+ExecStart=/usr/bin/node /opt/forwardx-panel/dist/index.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now forwardx-panel
+systemctl status forwardx-panel --no-pager
+```
 
 ## 配置域名和 HTTPS
 
