@@ -125,15 +125,6 @@ export default function PublicHome() {
 
       <footer className="mx-auto flex w-full max-w-6xl flex-wrap items-center justify-between gap-3 px-4 pb-6 text-xs text-muted-foreground">
         <span>ForwardX v{info?.version || "-"}</span>
-        <div className="flex items-center gap-3">
-          <a href={info?.repoUrl || "#"} target="_blank" rel="noopener noreferrer" className="hover:text-foreground">
-            GitHub
-          </a>
-          <span className="text-muted-foreground/45">|</span>
-          <a href="https://t.me/ForwardX_panel" target="_blank" rel="noopener noreferrer" className="hover:text-foreground">
-            TG群组
-          </a>
-        </div>
       </footer>
     </div>
   );

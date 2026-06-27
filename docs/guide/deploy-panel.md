@@ -37,6 +37,8 @@ journalctl -u forwardx-panel -n 300 --no-pager
 /opt/forwardx-panel
 ```
 
+如需卸载本地面板，请先阅读 [卸载 ForwardX](./uninstall.md)，确认是否保留安装目录和数据库。
+
 ## 配置域名和 HTTPS
 
 建议使用 Nginx、Caddy 或宝塔反向代理到面板端口。

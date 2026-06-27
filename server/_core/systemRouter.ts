@@ -66,7 +66,7 @@ export {
  *   - settings：登录后只读访问/管理员可写的系统设置
  */
 
-export const REPO_URL = "https://github.com/poouo/Forwardx";
+export const REPO_URL = "https://github.com/Su-cyber-art/Forwardx";
 /** Telegram 双向消息机器人：用户可通过此反馈问题、接收补充信息 */
 export const TELEGRAM_BOT_URL = "https://t.me/miyin_private_bot";
 const ANDROID_APK_DOWNLOAD_URL =
@@ -519,6 +519,13 @@ function appendUpgradeLog(line: string) {
 function normalizeUpgradeCommand(command: string) {
   const trimmed = command.trim();
   if (!trimmed) return "";
+  const missingLocalPanelUpgrade = trimmed.match(/^(?:\/bin\/bash|\/usr\/bin\/bash|bash)\s+(\S*install-panel-local\.sh)\s+upgrade\s*$/i);
+  if (missingLocalPanelUpgrade) {
+    const scriptPath = missingLocalPanelUpgrade[1].replace(/^['"]|['"]$/g, "");
+    if (!fs.existsSync(scriptPath)) {
+      return MANUAL_LOCAL_UPGRADE_COMMAND;
+    }
+  }
   if (/^(?:bash|sh|\/bin\/bash|\/usr\/bin\/bash|\/bin\/sh|\/usr\/bin\/sh)\s+/i.test(trimmed)) {
     return trimmed;
   }

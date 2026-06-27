@@ -4,7 +4,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { AGENT_VERSION, APP_VERSION } from "../shared/versions";
 
-const REPO_URL = "https://github.com/poouo/Forwardx";
+const REPO_URL = "https://github.com/Su-cyber-art/Forwardx";
 const MAX_AGENT_ASSET_BYTES = 80 * 1024 * 1024;
 const fetchLocks = new Map<string, Promise<string | null>>();
 
@@ -15,6 +15,8 @@ export const AGENT_ASSET_NAMES = [
   "forwardx-fxp-linux-arm64",
   "forwardx-runtime-linux-amd64",
   "forwardx-runtime-linux-arm64",
+  "forwardx-udp2raw-linux-amd64",
+  "forwardx-udp2raw-linux-arm64",
 ] as const;
 
 export const AGENT_ASSET_NAME_SET = new Set<string>(AGENT_ASSET_NAMES);

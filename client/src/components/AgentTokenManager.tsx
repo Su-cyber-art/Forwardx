@@ -490,8 +490,8 @@ export default function AgentTokenManager({
     const curlScriptArgs = "--connect-timeout 15 --speed-limit 1024 --speed-time 60";
     const panelCommand = withPipefail(`curl -fsSL ${curlScriptArgs} "${panelUrl}/api/agent/install.sh" | ${bashPrefix} -s -- ${args}`);
     const githubScriptUrl = githubAcceleratorActive
-      ? `${githubAcceleratorUrl}/https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install-agent.sh`
-      : "https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install-agent.sh";
+      ? `${githubAcceleratorUrl}/https://raw.githubusercontent.com/Su-cyber-art/Forwardx/main/scripts/install-agent.sh`
+      : "https://raw.githubusercontent.com/Su-cyber-art/Forwardx/main/scripts/install-agent.sh";
     const githubCommand = withPipefail(`curl -fsSL ${curlScriptArgs} "${githubScriptUrl}" | PANEL_URL=${shellQuote(panelUrl)} ${bashPrefix} -s -- ${args}`);
     if (agentPreferPanelInstall) {
       return `${panelCommand} || ${githubCommand}`;
