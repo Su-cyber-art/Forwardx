@@ -174,9 +174,6 @@ function getLayoutUpgradeProgress(job: any) {
       label: "下载或拉取资产",
       done: matched([
         /Downloading panel bundle/i,
-        /Pulling image/i,
-        /Downloaded newer image/i,
-        /Image is up to date/i,
         /load metadata/i,
         /load build context/i,
         /pnpm install/i,

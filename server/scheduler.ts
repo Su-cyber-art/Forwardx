@@ -7,6 +7,8 @@ import { sendTelegramMessage } from "./telegramBot";
 import { recordTunnelHopTestResult } from "./tunnelHopTestState";
 import { recordHopTestResult } from "./hopTestState";
 import { primeHostStatusNotifier, sweepOfflineHostsAndNotify } from "./hostStatusNotifier";
+import { normalizeLinkProbeMethod } from "@shared/latencyProbe";
+import { structuredLinkTestMessage, tunnelHopLatencyMode, tunnelHopModeText } from "./linkTestMessages";
 
 type TimedOutForwardTest = {
   id: number;
@@ -15,58 +17,10 @@ type TimedOutForwardTest = {
   message: string | null;
 };
 
+const SELF_TEST_TIMEOUT_SECONDS = 30;
+
 let hostStatusPrimePromise: Promise<void> | null = null;
 
-function structuredLinkTestMessage(input: {
-  kind: string;
-  message: string;
-  details?: any[];
-  totalLatencyMs?: number | null;
-  groupId?: number | null;
-  tunnelId?: number | null;
-}) {
-  return JSON.stringify({
-    kind: input.kind,
-    ...(input.groupId ? { groupId: input.groupId } : {}),
-    ...(input.tunnelId ? { tunnelId: input.tunnelId } : {}),
-    message: input.message,
-    details: input.details || [],
-    totalLatencyMs: input.totalLatencyMs ?? null,
-  });
-}
-
-function tunnelHopLatencyMode(meta: any): "sum" | "max" | "multi-source" {
-  const value = String(meta?.latencyMode || "");
-  return value === "max" || value === "multi-source" ? value : "sum";
-}
-
-function tunnelHopModeText(latencyMode: "sum" | "max" | "multi-source") {
-  if (latencyMode === "max") {
-    return {
-      kind: "tunnel-load-balance-summary",
-      label: "多出口负载探测",
-      successPrefix: "多出口负载探测成功",
-      failurePrefix: "多出口负载探测失败",
-      totalLabel: "最大延迟",
-    };
-  }
-  if (latencyMode === "multi-source") {
-    return {
-      kind: "tunnel-entry-group-summary",
-      label: "多入口隧道探测",
-      successPrefix: "多入口隧道探测成功",
-      failurePrefix: "多入口隧道探测失败",
-      totalLabel: "总延迟",
-    };
-  }
-  return {
-    kind: "tunnel-hop-summary",
-    label: "多级隧道逐跳测试",
-    successPrefix: "多级隧道逐跳测试成功",
-    failurePrefix: "多级隧道逐跳测试失败",
-    totalLabel: undefined,
-  };
-}
 async function refreshUserRuleAgents(userId: number, reason: string) {
   const rules = await db.getForwardRulesForUserSync(userId);
   const hostIds = new Set<number>();
@@ -233,7 +187,7 @@ async function settleTimedOutTunnelTests(timedOutTests: TimedOutForwardTest[], t
         message,
         hopLabel,
         routeLabel,
-        method: (meta as any).method === "ping" ? "ping" : "tcp",
+        method: normalizeLinkProbeMethod((meta as any).method),
       }, {
         successPrefix: "端口转发链逐跳测试成功",
         failurePrefix: "端口转发链逐跳测试失败",
@@ -269,9 +223,9 @@ async function settleTimedOutTunnelTests(timedOutTests: TimedOutForwardTest[], t
 
 async function runSelfTestTimeoutSweep() {
   try {
-    const timedOutTests = await db.timeoutStaleForwardTests(60);
+    const timedOutTests = await db.timeoutStaleForwardTests(SELF_TEST_TIMEOUT_SECONDS);
     if (timedOutTests.length > 0) {
-      await settleTimedOutTunnelTests(timedOutTests, 60);
+      await settleTimedOutTunnelTests(timedOutTests, SELF_TEST_TIMEOUT_SECONDS);
       for (const test of timedOutTests) {
         const meta = parseSelfTestMeta(test.message);
         if (meta?.kind === "tunnel" || meta?.kind === "tunnel-hop") continue;
@@ -280,7 +234,7 @@ async function runSelfTestTimeoutSweep() {
           : meta && "tunnelId" in meta && typeof meta.tunnelId === "number"
             ? ` tunnel=${meta.tunnelId}`
             : "";
-        appendPanelLog("warn", `[SelfTest] rule=${test.ruleId}${targetPart} host=${test.hostId} timeout after 60s test=${test.id}`);
+        appendPanelLog("warn", `[SelfTest] rule=${test.ruleId}${targetPart} host=${test.hostId} timeout after ${SELF_TEST_TIMEOUT_SECONDS}s test=${test.id}`);
       }
       console.log(`[Scheduler] Self-test timeout sweep: ${timedOutTests.length} test(s) marked as timeout`);
     }

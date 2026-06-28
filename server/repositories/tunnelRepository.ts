@@ -76,6 +76,98 @@ export async function updateTunnel(id: number, data: Partial<InsertTunnel>) {
   await db.update(tunnels).set({ ...data, updatedAt: nowDate() }).where(eq(tunnels.id, id));
 }
 
+function hostEntryAddress(host: any) {
+  return String(host?.entryIp || host?.ipv4 || host?.ipv6 || host?.ip || "").trim();
+}
+
+function hostPrivateAddress(host: any) {
+  return String(host?.tunnelEntryIp || "").trim();
+}
+
+function hostIpv6Address(host: any) {
+  return String(host?.ipv6 || "").trim();
+}
+
+function nextStoredConnectHost(stored: unknown, currentHost: any, previousHost?: any) {
+  const value = String(stored || "").trim();
+  const currentPrivate = hostPrivateAddress(currentHost);
+  const currentIpv6 = hostIpv6Address(currentHost);
+  const previousPrivate = hostPrivateAddress(previousHost);
+  const previousIpv6 = hostIpv6Address(previousHost);
+  const previousPublic = hostEntryAddress(previousHost);
+  if (previousPrivate && value === previousPrivate) return currentPrivate || null;
+  if (previousIpv6 && value === previousIpv6) return currentIpv6 || null;
+  if (previousPublic && value === previousPublic) return null;
+  return undefined;
+}
+
+export async function syncTunnelsForHostAddress(hostId: number, previousHost?: any) {
+  const db = await getDb();
+  if (!db) return;
+  const id = Number(hostId);
+  if (!Number.isFinite(id) || id <= 0) return;
+  const currentHost = await getHostById(id);
+  if (!currentHost) return;
+  const now = nowDate();
+
+  const directTunnels = await getTunnelsByHost(id);
+  for (const tunnel of directTunnels as any[]) {
+    if (Number(tunnel.exitHostId || 0) !== id) continue;
+    const stored = String(tunnel.connectHost || "").trim();
+    const privateAddr = hostPrivateAddress(currentHost);
+    const migrated = nextStoredConnectHost(stored, currentHost, previousHost);
+    const legacyPrivate = String(tunnel.networkType || "public") === "private" && !stored;
+    const nextConnectHost = migrated !== undefined
+      ? migrated
+      : legacyPrivate
+        ? privateAddr || null
+        : undefined;
+    if (nextConnectHost !== undefined && (stored || null) !== nextConnectHost) {
+      await db.update(tunnels).set({
+        connectHost: nextConnectHost,
+        networkType: nextConnectHost && privateAddr && nextConnectHost === privateAddr ? "private" : "public",
+        isRunning: false,
+        updatedAt: now,
+      } as any).where(eq(tunnels.id, Number(tunnel.id)));
+    }
+  }
+
+  const hopRows = await db.select().from(tunnelHops).where(eq(tunnelHops.hostId, id));
+  for (const hop of hopRows as any[]) {
+    const stored = String(hop.connectHost || "").trim();
+    const nextConnectHost = nextStoredConnectHost(stored, currentHost, previousHost);
+    if (nextConnectHost !== undefined && (stored || null) !== nextConnectHost) {
+      await db.update(tunnelHops).set({
+        connectHost: nextConnectHost,
+      } as any).where(eq(tunnelHops.id, Number(hop.id)));
+    }
+  }
+
+  const exitRows = await db.select().from(tunnelExitNodes).where(eq(tunnelExitNodes.hostId, id));
+  for (const node of exitRows as any[]) {
+    const stored = String(node.connectHost || "").trim();
+    const nextConnectHost = nextStoredConnectHost(stored, currentHost, previousHost);
+    if (nextConnectHost !== undefined && (stored || null) !== nextConnectHost) {
+      await db.update(tunnelExitNodes).set({
+        connectHost: nextConnectHost,
+        updatedAt: now,
+      } as any).where(eq(tunnelExitNodes.id, Number(node.id)));
+    }
+  }
+}
+
+export async function clearTunnelTestSnapshot(id: number) {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(tunnels).set({
+    lastLatencyMs: null,
+    lastTestStatus: null,
+    lastTestMessage: null,
+    lastTestAt: null,
+    updatedAt: nowDate(),
+  } as any).where(eq(tunnels.id, id));
+}
+
 export async function deleteTunnel(id: number) {
   const db = await getDb();
   if (!db) return;
@@ -222,10 +314,6 @@ export async function findAvailableTunnelExitPort(
     eq(forwardRules.isEnabled, true),
     eq(forwardRules.pendingDelete, false),
   ));
-  const usedUdpOverTcpPorts = await db.select({ port: forwardRules.udpOverTcpPort }).from(forwardRules).where(and(
-    eq(forwardRules.isEnabled, true),
-    eq(forwardRules.pendingDelete, false),
-  ));
   const usedMappedExitPorts = await db.select({ port: forwardRuleTunnelExits.tunnelExitPort }).from(forwardRuleTunnelExits).where(eq(forwardRuleTunnelExits.exitHostId, exitHostId));
   const used = new Set<number>();
   reservedPorts.forEach((port) => {
@@ -236,9 +324,6 @@ export async function findAvailableTunnelExitPort(
   usedTunnelPorts.forEach((r: any) => used.add(Number(r.port)));
   usedExtraTunnelPorts.forEach((r: any) => used.add(Number(r.port)));
   usedExitPorts.forEach((r: any) => {
-    if (r.port != null) used.add(Number(r.port));
-  });
-  usedUdpOverTcpPorts.forEach((r: any) => {
     if (r.port != null) used.add(Number(r.port));
   });
   usedMappedExitPorts.forEach((r: any) => {
@@ -295,15 +380,6 @@ export async function isPortUsedOnHost(hostId: number, sourcePort: number, exclu
   if (excludeRuleId) conds.push(sql`${forwardRules.id} != ${excludeRuleId}`);
   const r = await db.select({ count: sqlCountAll() }).from(forwardRules).where(and(...conds));
   if ((Number(r[0]?.count) || 0) > 0) return true;
-  const udpConds: any[] = [
-    eq(forwardRules.udpOverTcpPort, sourcePort),
-    eq(forwardRules.isForwardGroupTemplate, false),
-    eq(forwardRules.isEnabled, true),
-    eq(forwardRules.pendingDelete, false),
-  ];
-  if (excludeRuleId) udpConds.push(sql`${forwardRules.id} != ${excludeRuleId}`);
-  const udpRows = await db.select({ count: sqlCountAll() }).from(forwardRules).where(and(...udpConds));
-  if ((Number(udpRows[0]?.count) || 0) > 0) return true;
   const exitRows = await db.select({ count: sqlCountAll() }).from(forwardRuleTunnelExits).where(and(
     eq(forwardRuleTunnelExits.exitHostId, hostId),
     eq(forwardRuleTunnelExits.tunnelExitPort, sourcePort),

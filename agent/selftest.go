@@ -11,22 +11,22 @@ import (
 func selfTestPoller(cfg Config) {
 	activeUntil := time.Time{}
 	for {
+		var resp selfTestResp
+		if err := post(cfg, "/api/agent/selftest-pull", map[string]any{}, &resp); err != nil {
+			logf("selftest pull error: %v", err)
+		} else {
+			if len(resp.SelfTests) > 0 {
+				activeUntil = time.Now().Add(selfTestActiveWindow)
+			}
+			for _, t := range resp.SelfTests {
+				go handleSelfTest(cfg, t)
+			}
+		}
 		interval := selfTestIdlePollInterval
 		if time.Now().Before(activeUntil) {
 			interval = selfTestActivePollInterval
 		}
 		time.Sleep(interval)
-		var resp selfTestResp
-		if err := post(cfg, "/api/agent/selftest-pull", map[string]any{}, &resp); err != nil {
-			logf("selftest pull error: %v", err)
-			continue
-		}
-		if len(resp.SelfTests) > 0 {
-			activeUntil = time.Now().Add(selfTestActiveWindow)
-		}
-		for _, t := range resp.SelfTests {
-			go handleSelfTest(cfg, t)
-		}
 	}
 }
 
@@ -34,6 +34,9 @@ func handleSelfTest(cfg Config, t selfTest) {
 	method := strings.ToLower(strings.TrimSpace(t.Method))
 	if method == "" {
 		method = strings.ToLower(strings.TrimSpace(t.Protocol))
+	}
+	if normalizeRuntimeProtocol(method) == "udp" {
+		method = "ping"
 	}
 	if method == "ping" {
 		latency, reachable, detail := pingLatency(t.TargetIP, 3*time.Second)

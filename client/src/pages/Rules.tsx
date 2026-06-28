@@ -83,6 +83,7 @@ import {
   type ForwardType,
   type ForwardProtocolKey,
 } from "@shared/forwardTypes";
+import { ruleLatencyProbeMethodForRule } from "@shared/latencyProbe";
 import { Fragment, lazy, Suspense, useState, useMemo, useEffect, useCallback, useRef, type ReactNode } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { toast } from "sonner";
@@ -98,6 +99,7 @@ import {
 } from "@/lib/linkTestNodeMeta";
 import { getTunnelHopIds, getTunnelRouteText, tunnelHopHostName } from "@/lib/tunnelDisplay";
 import { useUrlTab } from "@/hooks/useUrlTab";
+import { useIsMobile } from "@/hooks/useMobile";
 
 const loadReactGlobe = () => import("react-globe.gl");
 const ReactGlobe = lazy(loadReactGlobe) as typeof import("react-globe.gl").default;
@@ -427,9 +429,6 @@ function storeRuleViewMode(viewMode: RuleViewMode) {
 }
 
 function getDefaultRuleCardSize(): RuleCardSize {
-  if (typeof window !== "undefined" && window.matchMedia("(max-width: 639px)").matches) {
-    return "compact";
-  }
   return "standard";
 }
 
@@ -2085,6 +2084,7 @@ function normalizeFailoverTargetsForSubmit(text: string) {
 
 function RulesContent() {
   const { user } = useAuth();
+  const isMobile = useIsMobile();
   const utils = trpc.useUtils();
   const [secondaryQueriesReady, setSecondaryQueriesReady] = useState(false);
   useEffect(() => {
@@ -2147,6 +2147,8 @@ function RulesContent() {
   });
   const [viewMode, setViewMode] = useState<RuleViewMode>(() => getStoredRuleViewMode());
   const [ruleCardSize, setRuleCardSize] = useState<RuleCardSize>(() => getStoredRuleCardSize());
+  const effectiveViewMode: RuleViewMode = isMobile ? "card" : viewMode;
+  const effectiveRuleCardSize: RuleCardSize = isMobile ? "standard" : ruleCardSize;
   const [trafficRange, setTrafficRange] = useState<RuleTrafficRange>("24h");
   const [rulePageSize, setRulePageSize] = useState<RulePageSize>(() =>
     getStoredRulePageSize(getStoredRuleCardSize() === "compact" ? 24 : 12)
@@ -2245,7 +2247,7 @@ function RulesContent() {
 
   const importCreateMutation = trpc.rules.create.useMutation();
 
-  const [trafficDetailRule, setTrafficDetailRule] = useState<{ id: number; name: string; isForwardChain?: boolean } | null>(null);
+  const [trafficDetailRule, setTrafficDetailRule] = useState<{ id: number; name: string; isForwardChain?: boolean; probeMethod?: "tcping" | "ping" } | null>(null);
   const [selfTestRule, setSelfTestRule] = useState<{ id: number; name: string } | null>(null);
 
   useEffect(() => {
@@ -2662,13 +2664,13 @@ function RulesContent() {
     && proxyProtocolForwardType === "realm"
     && !isTunnelProxyProtocolMode;
   const canUseUdpOverTcp = !selectedForwardGroupIsChain
-    && form.protocol === "both"
+    && (form.protocol === "udp" || form.protocol === "both")
     && proxyProtocolForwardType === "gost"
     && isForwardXTunnelMode;
   const transportTuningDisabledText = selectedForwardGroupIsChain
     ? "端口转发链不支持传输优化。"
-    : !proxyProtocolProtocolSupported
-    ? "传输优化仅支持 TCP 协议。"
+    : !proxyProtocolProtocolSupported && form.protocol !== "udp"
+    ? "当前协议不支持可用传输优化。"
     : "当前转发工具不支持该优化。";
 
   const kernelForwardWarning = useMemo(() => buildKernelForwardWarning({
@@ -2789,13 +2791,13 @@ function RulesContent() {
   }, [canUseProxyProtocol, form.proxyProtocolExitReceive, form.proxyProtocolExitSend, form.proxyProtocolReceive, form.proxyProtocolSend]);
 
   useEffect(() => {
-    if ((canUseTcpFastOpen || !form.tcpFastOpen) && (canUseZeroCopy || !form.zeroCopy) && (canUseUdpOverTcp || (!form.udpOverTcp && !form.udpOverTcpPort))) return;
+    if ((canUseTcpFastOpen || !form.tcpFastOpen) && (canUseZeroCopy || !form.zeroCopy) && (canUseUdpOverTcp || !form.udpOverTcp) && !form.udpOverTcpPort) return;
     setForm((prev) => ({
       ...prev,
       tcpFastOpen: canUseTcpFastOpen ? prev.tcpFastOpen : false,
       zeroCopy: canUseZeroCopy ? prev.zeroCopy : false,
       udpOverTcp: canUseUdpOverTcp ? prev.udpOverTcp : false,
-      udpOverTcpPort: canUseUdpOverTcp ? prev.udpOverTcpPort : 0,
+      udpOverTcpPort: 0,
     }));
   }, [canUseTcpFastOpen, canUseZeroCopy, canUseUdpOverTcp, form.tcpFastOpen, form.zeroCopy, form.udpOverTcp, form.udpOverTcpPort]);
 
@@ -3016,7 +3018,7 @@ function RulesContent() {
       tcpFastOpen: canUseTcpFastOpen ? form.tcpFastOpen : false,
       zeroCopy: canUseZeroCopy ? form.zeroCopy : false,
       udpOverTcp: canUseUdpOverTcp ? form.udpOverTcp : false,
-      udpOverTcpPort: canUseUdpOverTcp && form.udpOverTcp ? Number(form.udpOverTcpPort || 0) || null : null,
+      udpOverTcpPort: null,
     };
     if (!isForwardGroupRouteMode && portStatus === "used") {
       toast.error("源端口已被占用，请更换端口或使用随机分配");
@@ -3136,10 +3138,10 @@ function RulesContent() {
   ), [filteredRules]);
   const ruleTargetGeoAddresses = useMemo(() => (
     Array.from(new Set([
-      ...(viewMode === "globe" ? ruleGlobeTargetAddresses : []),
+      ...(effectiveViewMode === "globe" ? ruleGlobeTargetAddresses : []),
       selfTestTargetAddress,
     ].filter(Boolean))).slice(0, 100)
-  ), [ruleGlobeTargetAddresses, selfTestTargetAddress, viewMode]);
+  ), [effectiveViewMode, ruleGlobeTargetAddresses, selfTestTargetAddress]);
   const { data: ruleTargetGeoRows, isFetched: ruleTargetGeoFetched, isError: ruleTargetGeoError } = trpc.rules.targetGeoBatch.useQuery(
     { targets: ruleTargetGeoAddresses },
     {
@@ -3148,7 +3150,7 @@ function RulesContent() {
       refetchOnWindowFocus: false,
     }
   );
-  const targetGeoLookupReady = viewMode !== "globe" || ruleGlobeTargetAddresses.length === 0 || ruleTargetGeoFetched || ruleTargetGeoError;
+  const targetGeoLookupReady = effectiveViewMode !== "globe" || ruleGlobeTargetAddresses.length === 0 || ruleTargetGeoFetched || ruleTargetGeoError;
   const targetGeoByAddress = useMemo(() => {
     const map = new Map<string, RuleTargetGeo>();
     (ruleTargetGeoRows || []).forEach((row: any) => {
@@ -3178,13 +3180,24 @@ function RulesContent() {
       refetchOnWindowFocus: false,
     }
   );
+  const { data: dailyTrafficSummary } = trpc.rules.trafficSummary.useQuery(
+    { hours: 24, range: "24h", ruleIds: visibleRuleIdsForMetrics },
+    {
+      enabled: secondaryQueriesReady && trafficRange === "total" && visibleRuleIdsForMetrics.length > 0,
+      refetchInterval: 15000,
+      staleTime: 5000,
+      refetchOnWindowFocus: false,
+    }
+  );
   const [stableTrafficSummaryRows, setStableTrafficSummaryRows] = useState<any[]>([]);
   const [stableTotalTrafficSummaryRows, setStableTotalTrafficSummaryRows] = useState<any[]>([]);
+  const [stableDailyTrafficSummaryRows, setStableDailyTrafficSummaryRows] = useState<any[]>([]);
   const resetTrafficMutation = trpc.rules.resetTraffic.useMutation({
     onSuccess: async () => {
       clearRuleTrafficStatCaches();
       setStableTrafficSummaryRows([]);
       setStableTotalTrafficSummaryRows([]);
+      setStableDailyTrafficSummaryRows([]);
       await Promise.all([
         utils.rules.trafficSummary.invalidate(),
         utils.rules.traffic.invalidate(),
@@ -3218,8 +3231,18 @@ function RulesContent() {
       setStableTotalTrafficSummaryRows(totalTrafficSummary);
     }
   }, [totalTrafficSummary, trafficRange, visibleRuleIdsForMetrics.length]);
+  useEffect(() => {
+    if (trafficRange !== "total" || visibleRuleIdsForMetrics.length === 0) {
+      setStableDailyTrafficSummaryRows([]);
+      return;
+    }
+    if (dailyTrafficSummary) {
+      setStableDailyTrafficSummaryRows(dailyTrafficSummary);
+    }
+  }, [dailyTrafficSummary, trafficRange, visibleRuleIdsForMetrics.length]);
   const trafficSummaryRows = visibleRuleIdsForMetrics.length === 0 ? [] : trafficSummary ?? stableTrafficSummaryRows;
   const totalTrafficSummaryRows = trafficRange === "total" || visibleRuleIdsForMetrics.length === 0 ? [] : totalTrafficSummary ?? stableTotalTrafficSummaryRows;
+  const dailyTrafficSummaryRows = trafficRange === "24h" || visibleRuleIdsForMetrics.length === 0 ? trafficSummaryRows : dailyTrafficSummary ?? stableDailyTrafficSummaryRows;
   const trafficByRule = useMemo(() => {
     const m = new Map<number, {
       bytesIn: number;
@@ -3256,6 +3279,23 @@ function RulesContent() {
     });
     return m;
   }, [trafficSummaryRows]);
+  const dailyTrafficByRule = useMemo(() => {
+    const m = new Map<number, { bytesIn: number; bytesOut: number }>();
+    dailyTrafficSummaryRows.forEach((t: any) => {
+      const rid = Number(t.ruleId);
+      const prev = m.get(rid);
+      if (prev) {
+        prev.bytesIn += Number(t.bytesIn) || 0;
+        prev.bytesOut += Number(t.bytesOut) || 0;
+      } else {
+        m.set(rid, {
+          bytesIn: Number(t.bytesIn) || 0,
+          bytesOut: Number(t.bytesOut) || 0,
+        });
+      }
+    });
+    return m;
+  }, [dailyTrafficSummaryRows]);
   const totalTrafficByRule = useMemo(() => {
     const m = new Map<number, { bytesIn: number; bytesOut: number }>();
     totalTrafficSummaryRows.forEach((t: any) => {
@@ -3363,6 +3403,68 @@ function RulesContent() {
       </span>
     );
   };
+  const getTunnelSelectText = (tunnel: any) => `${tunnel?.name || `隧道 #${tunnel?.id || "-"}`} / ${getTunnelRouteText(tunnel, hosts)} / ${String(tunnel?.mode || "").toUpperCase()}`;
+  const getTunnelStatusText = (tunnel: any) => {
+    if (tunnel?.isRunning) return "运行中";
+    if (tunnel?.isEnabled) return "已启用";
+    return "已停用";
+  };
+  const renderTunnelSelectStatusDot = (tunnel: any) => {
+    if (tunnel?.isRunning) return <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-chart-2 shadow-sm shadow-chart-2/50 animate-pulse" aria-hidden="true" />;
+    if (tunnel?.isEnabled) return <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-amber-400 shadow-sm shadow-amber-400/50" aria-hidden="true" />;
+    return <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-muted-foreground/30" aria-hidden="true" />;
+  };
+  const renderTunnelSelectLabel = (tunnel: any) => (
+    <span className="inline-flex min-w-0 items-center gap-2" title={`${getTunnelStatusText(tunnel)} / ${getTunnelSelectText(tunnel)}`}>
+      {renderTunnelSelectStatusDot(tunnel)}
+      <span className="min-w-0 truncate">{getTunnelSelectText(tunnel)}</span>
+      <span className="sr-only">{getTunnelStatusText(tunnel)}</span>
+    </span>
+  );
+  const getForwardGroupSelectText = (group: any) => `${group?.name || `转发组 #${group?.id || "-"}`} / ${getForwardGroupKindLabel(group)} / ${group?.members?.length || 0} 成员`;
+  const getForwardGroupConfigStatus = (group: any): "available" | "pending" | "unavailable" | "error" | "disabled" => {
+    if (!group) return "unavailable";
+    if (group.isEnabled === false) return "disabled";
+    if (isForwardChainGroup(group)) return "available";
+    const mode = normalizeForwardGroupModeForRule(group);
+    const enabledMembers = Array.isArray(group.members) ? group.members.filter((member: any) => member.isEnabled !== false) : [];
+    if (enabledMembers.length === 0) return "unavailable";
+    if ((mode === "failover" || mode === "entry") && !String(group.domain || "").trim()) return "unavailable";
+    if (group.chinaHealthCheckEnabled) {
+      if (enabledMembers.some((member: any) => String(member.chinaHealthStatus || "unknown").toLowerCase() === "healthy")) {
+        return group.lastStatus === "error" ? "error" : "available";
+      }
+      if (enabledMembers.some((member: any) => String(member.chinaHealthStatus || "unknown").toLowerCase() !== "unhealthy")) return "pending";
+      return "unavailable";
+    }
+    return group.lastStatus === "error" ? "error" : "available";
+  };
+  const getForwardGroupStatusText = (group: any) => {
+    const status = getForwardGroupConfigStatus(group);
+    if (status === "disabled") return "已停用";
+    if (status === "available") return isForwardChainGroup(group) ? "链路可用" : "配置可用";
+    if (status === "pending") return "等待检测";
+    if (status === "error") return "异常";
+    return "不可用";
+  };
+  const renderForwardGroupSelectStatusDot = (group: any) => {
+    const status = getForwardGroupConfigStatus(group);
+    if (status === "disabled") return <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-muted-foreground/30" aria-hidden="true" />;
+    if (status === "available") {
+      return <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-chart-2 shadow-sm shadow-chart-2/50 animate-pulse" aria-hidden="true" />;
+    }
+    if (status === "error" || status === "unavailable") {
+      return <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-destructive/70 shadow-sm shadow-destructive/40" aria-hidden="true" />;
+    }
+    return <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-amber-400 shadow-sm shadow-amber-400/50" aria-hidden="true" />;
+  };
+  const renderForwardGroupSelectLabel = (group: any) => (
+    <span className="inline-flex min-w-0 items-center gap-2" title={`${getForwardGroupStatusText(group)} / ${getForwardGroupSelectText(group)}`}>
+      {renderForwardGroupSelectStatusDot(group)}
+      <span className="min-w-0 truncate">{getForwardGroupSelectText(group)}</span>
+      <span className="sr-only">{getForwardGroupStatusText(group)}</span>
+    </span>
+  );
   const renderTunnelRoute = (tunnel: any, compact = false) => {
     const hopIds = getTunnelHopIds(tunnel);
     return (
@@ -4246,11 +4348,18 @@ function RulesContent() {
         }
         return <span className="h-2.5 w-2.5 rounded-full bg-muted-foreground/30" />;
       }
-      if (group?.lastStatus === "healthy") {
+      const groupStatus = getForwardGroupConfigStatus(group);
+      if (groupStatus === "disabled") {
+        return <span className="h-2.5 w-2.5 rounded-full bg-muted-foreground/30" />;
+      }
+      if (groupStatus === "available") {
         return <span className="h-2.5 w-2.5 rounded-full bg-chart-2 shadow-sm shadow-chart-2/50 animate-pulse" />;
       }
-      if (group?.lastStatus === "down" || group?.lastStatus === "error") {
+      if (groupStatus === "error" || groupStatus === "unavailable") {
         return <span className="h-2.5 w-2.5 rounded-full bg-destructive/70 shadow-sm shadow-destructive/40" />;
+      }
+      if (groupStatus === "pending") {
+        return <span className="h-2.5 w-2.5 rounded-full bg-amber-400 shadow-sm shadow-amber-400/50" />;
       }
     }
     if (rule.isEnabled && rule.isRunning) {
@@ -4471,8 +4580,7 @@ function RulesContent() {
     </TooltipProvider>
   );
 
-  const renderRuleTrafficValue = (rule: any, direction: "in" | "out") => {
-    const t = trafficByRule.get(rule.id);
+  const renderTrafficBytesValue = (t: { bytesIn?: number | null; bytesOut?: number | null } | undefined, direction: "in" | "out") => {
     const value = direction === "in" ? Number(t?.bytesIn || 0) : Number(t?.bytesOut || 0);
     if (!t || value <= 0) {
       return <span className="text-xs text-muted-foreground">—</span>;
@@ -4486,6 +4594,14 @@ function RulesContent() {
     );
   };
 
+  const renderRuleTrafficValue = (rule: any, direction: "in" | "out") => (
+    renderTrafficBytesValue(trafficByRule.get(rule.id), direction)
+  );
+
+  const renderRuleDailyTrafficValue = (rule: any, direction: "in" | "out") => (
+    renderTrafficBytesValue(dailyTrafficByRule.get(rule.id), direction)
+  );
+
   const renderRuleTraffic = (rule: any) => {
     const t = trafficByRule.get(rule.id);
     if (!t || (t.bytesIn === 0 && t.bytesOut === 0)) {
@@ -4496,6 +4612,27 @@ function RulesContent() {
         {renderRuleTrafficValue(rule, "in")}
         {renderRuleTrafficValue(rule, "out")}
       </div>
+    );
+  };
+
+  const getRuleTotalTrafficSource = (rule: any) => (
+    trafficRange === "total" ? trafficByRule.get(rule.id) : totalTrafficByRule.get(rule.id)
+  );
+
+  const renderMobileRuleTotalTraffic = (rule: any) => {
+    const t = getRuleTotalTrafficSource(rule);
+    const total = Number(t?.bytesIn || 0) + Number(t?.bytesOut || 0);
+    if (!t || total <= 0) {
+      return <span className="text-xs text-muted-foreground">—</span>;
+    }
+    return (
+      <span
+        className="flex items-center gap-1 whitespace-nowrap text-xs font-medium tabular-nums text-foreground"
+        title={`累计入向 ${formatBytes(Number(t.bytesIn || 0))} / 出向 ${formatBytes(Number(t.bytesOut || 0))}`}
+      >
+        <ArrowRightLeft className="h-3 w-3 shrink-0 text-muted-foreground" />
+        {formatBytes(total)}
+      </span>
     );
   };
 
@@ -4550,14 +4687,17 @@ function RulesContent() {
         </div>
       );
     }
+    const ruleCategory = getRuleCategory(rule, forwardGroupById);
+    const isForwardChainRule = ruleCategory === "chain";
+    const probeMethod = ruleLatencyProbeMethodForRule(rule);
     return (
       <div className="flex items-center justify-end gap-1 whitespace-nowrap">
         <Button
           variant="ghost"
           size="icon"
           className="h-8 w-8"
-          onClick={() => setTrafficDetailRule({ id: rule.id, name: rule.name, isForwardChain: getRuleCategory(rule, forwardGroupById) === "chain" })}
-          title={getRuleCategory(rule, forwardGroupById) === "chain" ? "查看链路延迟" : "查看 TCPing 延迟"}
+          onClick={() => setTrafficDetailRule({ id: rule.id, name: rule.name, isForwardChain: isForwardChainRule, probeMethod })}
+          title={isForwardChainRule ? "查看链路延迟" : probeMethod === "ping" ? "查看 Ping 延迟" : "查看 TCPing 延迟"}
         >
           <Activity className="h-3.5 w-3.5" />
         </Button>
@@ -4622,7 +4762,7 @@ function RulesContent() {
     storeRuleCardSize(nextMode);
   };
 
-  const displayMode: RuleDisplayMode = viewMode === "table" || viewMode === "globe" ? viewMode : ruleCardSize;
+  const displayMode: RuleDisplayMode = effectiveViewMode === "table" || effectiveViewMode === "globe" ? effectiveViewMode : effectiveRuleCardSize;
 
   const handleRuleCategoryChange = (value: string) => {
     const next = (value === "local" || value === "tunnel" || value === "chain" || value === "group" ? value : "all") as RuleCategory;
@@ -4654,10 +4794,10 @@ function RulesContent() {
     });
   };
 
-  const ruleCardGridClass = ruleCardSize === "compact"
+  const ruleCardGridClass = effectiveRuleCardSize === "compact"
     ? "standard-card-grid-compact rule-card-grid-static rule-card-grid-static-compact gap-3"
     : "standard-card-grid rule-card-grid-static rule-card-grid-static-standard gap-4";
-  const ruleContentModeKey = viewMode === "card" ? "card" : displayMode;
+  const ruleContentModeKey = effectiveViewMode === "card" ? "card" : displayMode;
   const ruleContentTransitionKey = `${ruleCategory}-${ruleContentModeKey}-${isLoading ? "loading" : filteredRules.length > 0 ? "list" : "empty"}`;
 
   const renderRuleGroupIcon = (type: RuleGroupType, className = "h-4 w-4") => {
@@ -4752,7 +4892,7 @@ function RulesContent() {
   const renderRuleCard = (rule: any) => {
     const supported = isRuleSupported(rule);
     const protocolKey = getRuleProtocolKey(rule);
-    if (ruleCardSize === "compact") {
+    if (effectiveRuleCardSize === "compact") {
       return (
         <Card
           key={rule.id}
@@ -4870,14 +5010,18 @@ function RulesContent() {
               <Badge variant="secondary" className="whitespace-nowrap text-[10px]">{formatForwardRuleProtocol(rule.protocol)}</Badge>
             </div>
           </div>
-          <div className="grid grid-cols-3 gap-3 text-xs">
+          <div className="grid grid-cols-2 gap-x-3 gap-y-2 border-t border-border/40 pt-2 text-xs">
             <div className="min-w-0">
-              <div className="mb-1 text-muted-foreground">{trafficRangeLabel} 入向</div>
-              {renderRuleTrafficValue(rule, "in")}
+              <div className="mb-1 text-muted-foreground">24H 入向</div>
+              {renderRuleDailyTrafficValue(rule, "in")}
             </div>
             <div className="min-w-0">
-              <div className="mb-1 text-muted-foreground">{trafficRangeLabel} 出向</div>
-              {renderRuleTrafficValue(rule, "out")}
+              <div className="mb-1 text-muted-foreground">24H 出向</div>
+              {renderRuleDailyTrafficValue(rule, "out")}
+            </div>
+            <div className="min-w-0">
+              <div className="mb-1 text-muted-foreground">累计流量</div>
+              {renderMobileRuleTotalTraffic(rule)}
             </div>
             <div className="min-w-0">
               <div className="mb-1 text-muted-foreground">延迟</div>
@@ -4911,7 +5055,7 @@ function RulesContent() {
               fallbackValue="0 / 0 活跃"
             />
           </Badge>
-          <div className="hidden items-center overflow-hidden rounded-md border border-border/40 sm:flex">
+          <div className="hidden items-center overflow-hidden rounded-md border border-border/40 md:flex">
             <Button
               variant={displayMode === "compact" ? "secondary" : "ghost"}
               size="icon"
@@ -5197,7 +5341,7 @@ function RulesContent() {
         <DataSectionLoading label="正在加载转发规则" />
       ) : filteredRules.length > 0 ? (
         <>
-          {viewMode === "globe" ? (
+          {effectiveViewMode === "globe" ? (
             (!hosts || !tunnels || !forwardGroups) ? (
               <DataSectionLoading label="正在加载转发流量地图" />
             ) : (
@@ -5213,8 +5357,8 @@ function RulesContent() {
                 onEditRule={openEdit}
               />
             )
-          ) : viewMode === "card" ? (
-            <RuleCardModeTransition mode={ruleCardSize}>
+          ) : effectiveViewMode === "card" ? (
+            <RuleCardModeTransition mode={effectiveRuleCardSize}>
               {shouldGroupRuleCards ? (
                 <AutoAnimateContainer className="space-y-5">
                   {desktopRuleGroups.map((group) => {
@@ -5237,15 +5381,15 @@ function RulesContent() {
             </RuleCardModeTransition>
           ) : (
             <>
-              <RuleCardModeTransition mode={ruleCardSize} className="sm:hidden">
-                <AutoAnimateContainer layout={false} className={ruleCardSize === "compact" ? "grid rule-card-grid-static rule-card-grid-static-compact gap-2" : "grid rule-card-grid-static rule-card-grid-static-standard gap-3"}>
+              <RuleCardModeTransition mode={effectiveRuleCardSize} className="sm:hidden">
+                <AutoAnimateContainer layout={false} className={effectiveRuleCardSize === "compact" ? "grid rule-card-grid-static rule-card-grid-static-compact gap-2" : "grid rule-card-grid-static rule-card-grid-static-standard gap-3"}>
                   {shouldGroupRuleCards ? (
                     desktopRuleGroups.map((group) => {
                       const collapsed = !!ruleGroupCollapsed[group.type];
                       return (
                         <section key={group.type} className="space-y-2">
                           {renderRuleGroupHeader(group)}
-                          <RuleGroupItems open={!collapsed} layout={false} className={ruleCardSize === "compact" ? "grid rule-card-grid-static rule-card-grid-static-compact gap-2" : "grid rule-card-grid-static rule-card-grid-static-standard gap-3"}>
+                          <RuleGroupItems open={!collapsed} layout={false} className={effectiveRuleCardSize === "compact" ? "grid rule-card-grid-static rule-card-grid-static-compact gap-2" : "grid rule-card-grid-static rule-card-grid-static-standard gap-3"}>
                             {group.rules.map((rule: any) => renderRuleCard(rule))}
                           </RuleGroupItems>
                         </section>
@@ -5351,6 +5495,7 @@ function RulesContent() {
           ruleId={trafficDetailRule.id}
           ruleName={trafficDetailRule.name}
           isForwardChain={!!trafficDetailRule.isForwardChain}
+          probeMethod={trafficDetailRule.probeMethod}
           open={!!trafficDetailRule}
           onOpenChange={(v) => {
             if (!v) setTrafficDetailRule(null);
@@ -5382,7 +5527,7 @@ function RulesContent() {
           <DialogHeader>
             <DialogTitle>{editingId ? "编辑规则" : "添加转发规则"}</DialogTitle>
           </DialogHeader>
-          <div className="min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
+          <div className="min-h-0 flex-1 scroll-pb-28 space-y-3 overflow-y-auto pb-5 pr-1">
             <div className={segmentedControlClassName}>
               <div className="grid grid-cols-2 gap-1 sm:grid-cols-4">
                 <button
@@ -5450,8 +5595,8 @@ function RulesContent() {
                       <SelectContent>
                         <SelectItem value="none">请选择隧道</SelectItem>
                         {availableTunnels.map((t: any) => (
-                          <SelectItem key={t.id} value={String(t.id)}>
-                            {t.name} / {getTunnelRouteText(t, hosts)} / {String(t.mode).toUpperCase()}
+                          <SelectItem key={t.id} value={String(t.id)} textValue={getTunnelSelectText(t)}>
+                            {renderTunnelSelectLabel(t)}
                           </SelectItem>
                         ))}
                       </SelectContent>
@@ -5499,8 +5644,8 @@ function RulesContent() {
                       <SelectContent>
                         <SelectItem value="none">{form.routeMode === "chain" ? "请选择转发链" : "请选择转发组"}</SelectItem>
                         {(form.routeMode === "chain" ? availableForwardChainGroups : availableFailoverForwardGroups).map((group: any) => (
-                          <SelectItem key={group.id} value={String(group.id)}>
-                            {group.name} / {getForwardGroupKindLabel(group)} / {group.members?.length || 0} 成员
+                          <SelectItem key={group.id} value={String(group.id)} textValue={getForwardGroupSelectText(group)}>
+                            {renderForwardGroupSelectLabel(group)}
                           </SelectItem>
                         ))}
                       </SelectContent>
@@ -5547,8 +5692,8 @@ function RulesContent() {
                     proxyProtocolExitSend: v !== "udp" && isTunnelProxyProtocolMode ? form.proxyProtocolExitSend : false,
                     tcpFastOpen: v !== "udp" ? form.tcpFastOpen : false,
                     zeroCopy: v !== "udp" ? form.zeroCopy : false,
-                    udpOverTcp: v === "both" ? form.udpOverTcp : false,
-                    udpOverTcpPort: v === "both" ? form.udpOverTcpPort : 0,
+                    udpOverTcp: v === "udp" || v === "both" ? form.udpOverTcp : false,
+                    udpOverTcpPort: 0,
                   })}
                 >
                   <SelectTrigger><SelectValue /></SelectTrigger>
@@ -5752,24 +5897,16 @@ function RulesContent() {
               <div className="grid gap-2 sm:grid-cols-3">
                 {renderTransportTuningSwitch("TCP Fast Open", "降低 TCP 建连等待", "tcpFastOpen", canUseTcpFastOpen)}
                 {renderTransportTuningSwitch("zero-copy", "减少内核与用户态拷贝", "zeroCopy", canUseZeroCopy)}
-                {renderTransportTuningSwitch("UDP over TCP", "UDP 走伪装 TCP 通道", "udpOverTcp", canUseUdpOverTcp)}
+                {renderTransportTuningSwitch("mimic UDP 混淆", "专为 UDP 封锁环境优化，适合游戏场景", "udpOverTcp", canUseUdpOverTcp)}
               </div>
               {canUseUdpOverTcp && form.udpOverTcp && (
-                <div className="grid gap-2 sm:grid-cols-[minmax(0,220px)_1fr] sm:items-end">
-                  <div className="space-y-1">
-                    <Label className="text-xs">UDP over TCP 端口</Label>
-                    <Input
-                      type="number"
-                      min={0}
-                      max={65535}
-                      placeholder="0 自动分配"
-                      value={form.udpOverTcpPort || ""}
-                      onChange={(e) => setForm({ ...form, udpOverTcpPort: Number(e.target.value || 0) })}
-                    />
-                  </div>
-                  <p className="pb-2 text-[11px] leading-4 text-muted-foreground">
-                    开启后 UDP 会使用独立通道端口，留空或 0 自动分配；关闭时继续使用原来的单端口隧道。
+                <div className="space-y-1.5 text-[11px] leading-4">
+                  <p className="text-muted-foreground">
+                    开启后 ForwardX UDP 仍走原生 UDP 加密通道，并在配置网卡的 Agent 上通过 mimic 做 TCP 外观混淆；需要 Agent 系统已安装 mimic 和 mimic-dkms。
                   </p>
+                  <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-2.5 py-2 text-amber-700 dark:text-amber-300">
+                    mimic TCP 外观伪装会增加封装开销。游戏、直播或 UDP 测速在 1400 以上明显丢包时，建议把客户端或业务 UDP MTU 调整到 1200-1300。
+                  </div>
                 </div>
               )}
             </div>
@@ -5856,7 +5993,7 @@ function RulesContent() {
               )}
             </div>
           </div>
-          <DialogFooter>
+          <DialogFooter className="shrink-0 gap-2 border-t border-border/60 bg-background/95 pt-3">
             <Button variant="outline" onClick={() => setShowDialog(false)}>
               取消
             </Button>

@@ -7,6 +7,7 @@ import { pushTunnelEndpointRefresh } from "./helpers";
 import { requireRuleProtocolEnabled } from "../forwardProtocolSettings";
 import { createQueryCache } from "../queryCache";
 import { createHopTestBatch, registerHopTest } from "../hopTestState";
+import { linkProbeMethodForRule } from "@shared/latencyProbe";
 
 const selfTestQueryCache = createQueryCache(300);
 
@@ -97,6 +98,7 @@ export const selfTestRulesRouter = router({
           exitHostId: tunnel.exitHostId,
           targetIp,
           targetPort: rule.targetPort,
+          method: linkProbeMethodForRule(rule),
           refreshPushed: pushed,
         });
         appendPanelLog("info", `[SelfTest] rule=${rule.id} tunnel=${tunnel.id} queued tunnel+target test from exitHost=${tunnel.exitHostId} to target=${targetIp}:${rule.targetPort}`);

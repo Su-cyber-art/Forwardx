@@ -131,26 +131,49 @@ function isCollectionMode(mode: GroupMode) {
   return mode === "entry" || mode === "exit";
 }
 
-function isChinaHealthTargetValid(value: string) {
+function normalizeChinaHealthTargetInput(value: string) {
   const target = value.trim().replace(/^tcp:\/\//i, "").replace(/：/g, ":");
-  if (!target) return true;
-  if (target.length > 253 || /[\s'"<>/]/.test(target)) return false;
+  if (!target) return "";
+  if (target.length > 253 || /[\s'"<>/]/.test(target)) return undefined;
+  let host = target;
+  let port = 80;
   const bracketMatch = target.match(/^\[([^\]]+)\](?::(\d+))?$/);
   if (bracketMatch) {
-    const port = bracketMatch[2] ? Number(bracketMatch[2]) : 80;
-    return !!bracketMatch[1]?.trim() && Number.isInteger(port) && port >= 1 && port <= 65535;
+    host = bracketMatch[1]?.trim() || "";
+    port = bracketMatch[2] ? Number(bracketMatch[2]) : 80;
+  } else {
+    const lastColon = target.lastIndexOf(":");
+    if (lastColon > 0) {
+      const maybeHost = target.slice(0, lastColon).trim();
+      const maybePortText = target.slice(lastColon + 1);
+      const maybePort = Number(maybePortText);
+      const singleColonHostPort = target.indexOf(":") === lastColon;
+      const nakedIpv6HostPort = !singleColonHostPort && isValidIpv6Address(maybeHost);
+      if ((singleColonHostPort || nakedIpv6HostPort) && /^\d+$/.test(maybePortText) && Number.isInteger(maybePort) && maybePort >= 1 && maybePort <= 65535) {
+        host = maybeHost;
+        port = maybePort;
+      }
+    }
   }
-  const lastColon = target.lastIndexOf(":");
-  if (lastColon > 0 && target.indexOf(":") === lastColon) {
-    const port = Number(target.slice(lastColon + 1));
-    return !!target.slice(0, lastColon).trim() && Number.isInteger(port) && port >= 1 && port <= 65535;
-  }
-  return true;
+  host = unwrapBracketedHost(host).trim();
+  if (host.includes(":") && !isValidIpv6Address(host)) return undefined;
+  if (!host || host.length > 253 || /[\s'"<>/]/.test(host) || !Number.isInteger(port) || port < 1 || port > 65535) return undefined;
+  return isValidIpv6Address(host) ? `[${host}]:${port}` : `${host}:${port}`;
 }
-
 function unwrapBracketedHost(value: unknown) {
   const text = String(value || "").trim();
   return text.startsWith("[") && text.endsWith("]") ? text.slice(1, -1).trim() : text;
+}
+
+function isValidIpv6Address(value: unknown) {
+  const text = unwrapBracketedHost(value);
+  if (!text.includes(":")) return false;
+  try {
+    new URL(`http://[${text}]/`);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function looksLikeIpv4(value: unknown) {
@@ -261,6 +284,18 @@ function sameNullableStringArray(a: Array<string | null>, b: Array<string | null
   return true;
 }
 
+function addressKey(value: unknown) {
+  const text = String(value || "").trim();
+  const unwrapped = text.startsWith("[") && text.endsWith("]") ? text.slice(1, -1).trim() : text;
+  return unwrapped.toLowerCase();
+}
+
+function sameAddress(a: unknown, b: unknown) {
+  const left = addressKey(a);
+  const right = addressKey(b);
+  return !!left && !!right && left === right;
+}
+
 function hostPrivateAddress(host: any) {
   return String(host?.tunnelEntryIp || "").trim();
 }
@@ -274,8 +309,8 @@ function normalizeConnectHostForHost(value: unknown, host: any, fallback: string
   if (!text) return fallback;
   const privateAddr = hostPrivateAddress(host);
   const ipv6Addr = hostIpv6Address(host);
-  if (privateAddr && text === privateAddr) return privateAddr;
-  if (ipv6Addr && text === ipv6Addr) return ipv6Addr;
+  if (privateAddr && sameAddress(text, privateAddr)) return privateAddr;
+  if (ipv6Addr && sameAddress(text, ipv6Addr)) return ipv6Addr;
   return fallback;
 }
 
@@ -396,7 +431,7 @@ function ForwardGroupLatencyDialog({
           <div className="flex flex-col gap-2 pr-9 sm:flex-row sm:items-start sm:justify-between sm:pr-10">
             <div className="min-w-0">
               <DialogTitle>转发链延迟 - {groupName}</DialogTitle>
-              <DialogDescription>近 24 小时链路逐跳探测汇总，成员之间使用 Ping，出口到目标使用 TCPing。</DialogDescription>
+              <DialogDescription>近 24 小时链路逐跳探测汇总，纯 UDP 规则使用 Ping，其余规则使用 TCPing。</DialogDescription>
             </div>
             <LatencyPeakCutToggle id={`forward-group-peak-cut-${groupId}`} checked={peakCutEnabled} onCheckedChange={setPeakCutEnabled} className="shrink-0 self-start sm:pt-1" />
           </div>
@@ -708,10 +743,105 @@ export function ForwardGroupsContent({
   };
   const visibleGroups = groupsByMode[activeGroupMode] || [];
   const modeTotal = visibleGroups.length;
+  const groupConfigStateById = useMemo(() => {
+    const makeState = (
+      status: "disabled" | "available" | "pending" | "unavailable" | "error",
+      message: string,
+      memberIds: number[] = [],
+    ) => ({
+      status,
+      available: status === "available",
+      message,
+      usableMemberIds: new Set(memberIds),
+    });
+    const recordValueForMember = (group: any, member: any) => {
+      const recordType = (group.recordType === "AAAA" || group.recordType === "CNAME" ? group.recordType : "A") as GroupForm["recordType"];
+      if (member.memberType === "host") {
+        return forwardGroupRecordValueForHost(hostById.get(Number(member.hostId || 0)), recordType);
+      }
+      const tunnel = tunnelById.get(Number(member.tunnelId || 0));
+      return forwardGroupRecordValueForHost(hostById.get(Number(tunnel?.entryHostId || 0)), recordType);
+    };
+    const map = new Map<number, ReturnType<typeof makeState>>();
+    for (const group of groups || []) {
+      const mode = normalizeGroupMode(group.groupMode);
+      const members = Array.isArray(group.members) ? group.members : [];
+      const enabledMembers = members.filter((member: any) => member.isEnabled !== false);
+      const enabledMemberIds = enabledMembers.map((member: any) => Number(member.id || 0)).filter((id: number) => id > 0);
+      if (!group.isEnabled) {
+        map.set(Number(group.id), makeState("disabled", "转发组已停用"));
+        continue;
+      }
+      if (mode === "chain") {
+        const minMembers = Number(group.entryGroupId || 0) > 0 ? 1 : 2;
+        map.set(Number(group.id), enabledMembers.length >= minMembers
+          ? makeState("available", enabledMembers.length > 0 ? "转发链配置可用，链路状态在转发规则内判定。" : "转发链已保存。", enabledMemberIds)
+          : makeState("unavailable", Number(group.entryGroupId || 0) > 0 ? "转发链至少需要 1 个链路成员。" : "转发链至少需要 2 个链路成员。"));
+        continue;
+      }
+      if (mode === "exit") {
+        map.set(Number(group.id), enabledMembers.length > 0
+          ? makeState("available", "出口组配置可用，可作为隧道出口使用。", enabledMemberIds)
+          : makeState("unavailable", "出口组没有已启用主机。"));
+        continue;
+      }
+      if (!String(group.domain || "").trim()) {
+        map.set(Number(group.id), makeState("unavailable", mode === "entry" ? "入口组需要指定入口域名。" : "转发组需要指定 DDNS 域名。"));
+        continue;
+      }
+      if (enabledMembers.length === 0) {
+        map.set(Number(group.id), makeState("unavailable", "没有已启用成员。"));
+        continue;
+      }
+      const usableIds: number[] = [];
+      let pendingChina = 0;
+      let unhealthyChina = 0;
+      let missingRecord = 0;
+      for (const member of enabledMembers) {
+        if (!recordValueForMember(group, member)) {
+          missingRecord += 1;
+          continue;
+        }
+        if (group.chinaHealthCheckEnabled) {
+          const chinaStatus = String(member.chinaHealthStatus || "unknown").toLowerCase();
+          if (chinaStatus === "healthy") {
+            usableIds.push(Number(member.id));
+          } else if (chinaStatus === "unhealthy") {
+            unhealthyChina += 1;
+          } else {
+            pendingChina += 1;
+          }
+          continue;
+        }
+        usableIds.push(Number(member.id));
+      }
+      if (usableIds.length > 0) {
+        if (group.lastStatus === "error") {
+          map.set(Number(group.id), makeState("error", group.lastMessage || "DDNS 同步异常，请检查服务商配置。", usableIds));
+        } else {
+          const suffix = group.chinaHealthCheckEnabled ? "，入口健康度检测已通过。" : "。";
+          map.set(Number(group.id), makeState("available", `${usableIds.length} 个成员满足转发组配置${suffix}`, usableIds));
+        }
+      } else if (pendingChina > 0) {
+        map.set(Number(group.id), makeState("pending", "等待入口健康度检测结果。"));
+      } else if (unhealthyChina > 0) {
+        map.set(Number(group.id), makeState("unavailable", "入口健康度检测未通过。"));
+      } else if (missingRecord > 0) {
+        map.set(Number(group.id), makeState("unavailable", `${group.recordType || "A"} 记录缺少可用成员地址。`));
+      } else {
+        map.set(Number(group.id), makeState("unavailable", "没有满足配置要求的成员。"));
+      }
+    }
+    return map;
+  }, [groups, hostById, tunnelById]);
+  const getGroupConfigState = (group: any) => groupConfigStateById.get(Number(group?.id || 0)) || {
+    status: "unavailable" as const,
+    available: false,
+    message: "转发组配置不可用。",
+    usableMemberIds: new Set<number>(),
+  };
   const activeCount = visibleGroups.filter((g: any) => {
-    if (!g.isEnabled) return false;
-    if (activeGroupMode === "failover" || activeGroupMode === "entry") return g.lastStatus === "healthy";
-    return true;
+    return getGroupConfigState(g).available;
   }).length;
   const groupPagination = usePersistentPagination(visibleGroups, {
     storageKey: `forwardx.forwardGroups.${activeGroupMode}.page`,
@@ -1060,8 +1190,8 @@ export function ForwardGroupsContent({
     if (!Number.isInteger(recoverSeconds) || recoverSeconds < 10 || recoverSeconds > 3600) {
       return toast.error("恢复观察时间需为 10-3600 秒的整数");
     }
-    const chinaHealthTarget = form.chinaHealthCheckTarget.trim();
-    if (supportsChinaHealth && form.chinaHealthCheckEnabled && !isChinaHealthTargetValid(chinaHealthTarget)) {
+    const chinaHealthTarget = normalizeChinaHealthTargetInput(form.chinaHealthCheckTarget);
+    if (supportsChinaHealth && form.chinaHealthCheckEnabled && chinaHealthTarget === undefined) {
       return toast.error("入口健康度检测目标格式不正确");
     }
     const payload = {
@@ -1092,18 +1222,28 @@ export function ForwardGroupsContent({
 
   const groupStatusBadge = (group: any) => {
     const mode = normalizeGroupMode(group.groupMode);
-    if (!group.isEnabled) return <Badge variant="outline">停用</Badge>;
-    if (mode === "chain") return <Badge className="border-sky-500/20 bg-sky-500/10 text-sky-700 hover:bg-sky-500/20 hover:text-sky-900 dark:text-sky-300 dark:hover:bg-sky-500/20 dark:hover:text-sky-100">链路</Badge>;
-    if (mode === "entry") {
-      if (group.lastStatus === "error") return <Badge variant="destructive">DDNS 异常</Badge>;
-      if (group.lastStatus === "healthy") return <Badge className="border-emerald-500/20 bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/20 hover:text-emerald-900 dark:text-emerald-300 dark:hover:bg-emerald-500/20 dark:hover:text-emerald-100">已同步</Badge>;
-      return <Badge variant="secondary">等待同步</Badge>;
+    const configState = getGroupConfigState(group);
+    if (configState.status === "disabled") return <Badge variant="outline">停用</Badge>;
+    if (mode === "chain") {
+      return configState.available
+        ? <Badge className="border-sky-500/20 bg-sky-500/10 text-sky-700 hover:bg-sky-500/20 hover:text-sky-900 dark:text-sky-300 dark:hover:bg-sky-500/20 dark:hover:text-sky-100">链路</Badge>
+        : <Badge variant="destructive">不可用</Badge>;
     }
-    if (mode === "exit") return <Badge className="border-indigo-500/20 bg-indigo-500/10 text-indigo-700 hover:bg-indigo-500/20 hover:text-indigo-900 dark:text-indigo-300 dark:hover:bg-indigo-500/20 dark:hover:text-indigo-100">可选出口</Badge>;
-    if (group.lastStatus === "healthy") return <Badge className="border-emerald-500/20 bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/20 hover:text-emerald-900 dark:text-emerald-300 dark:hover:bg-emerald-500/20 dark:hover:text-emerald-100">健康</Badge>;
-    if (group.lastStatus === "down") return <Badge variant="destructive">不可用</Badge>;
-    if (group.lastStatus === "error") return <Badge variant="destructive">DDNS 异常</Badge>;
-    return <Badge variant="secondary">等待故障转移检查</Badge>;
+    if (mode === "entry") {
+      if (configState.status === "error") return <Badge variant="destructive">DDNS 异常</Badge>;
+      if (configState.status === "available") return <Badge className="border-emerald-500/20 bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/20 hover:text-emerald-900 dark:text-emerald-300 dark:hover:bg-emerald-500/20 dark:hover:text-emerald-100">可用</Badge>;
+      if (configState.status === "pending") return <Badge variant="secondary">等待检测</Badge>;
+      return <Badge variant="destructive">不可用</Badge>;
+    }
+    if (mode === "exit") {
+      return configState.available
+        ? <Badge className="border-indigo-500/20 bg-indigo-500/10 text-indigo-700 hover:bg-indigo-500/20 hover:text-indigo-900 dark:text-indigo-300 dark:hover:bg-indigo-500/20 dark:hover:text-indigo-100">可选出口</Badge>
+        : <Badge variant="destructive">不可用</Badge>;
+    }
+    if (configState.status === "error") return <Badge variant="destructive">DDNS 异常</Badge>;
+    if (configState.status === "available") return <Badge className="border-emerald-500/20 bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/20 hover:text-emerald-900 dark:text-emerald-300 dark:hover:bg-emerald-500/20 dark:hover:text-emerald-100">可用</Badge>;
+    if (configState.status === "pending") return <Badge variant="secondary">等待检测</Badge>;
+    return <Badge variant="destructive">不可用</Badge>;
   };
 
   const memberLabel = (member: any) => {
@@ -1112,11 +1252,13 @@ export function ForwardGroupsContent({
     return tunnel ? `${tunnel.name} / ${getTunnelRouteText(tunnel, hosts)}` : `隧道 #${member.tunnelId}`;
   };
 
-  const memberHealthTitle = (member: any) => {
-    const parts = [`链路 ${member.healthStatus || "unknown"}${member.lastLatencyMs ? ` / ${member.lastLatencyMs}ms` : ""}`];
+  const memberHealthTitle = (group: any, member: any) => {
+    const active = isGroupMemberActive(group, member);
+    const parts = [active ? "配置可用" : "配置未满足"];
     if (member.chinaHealthStatus && member.chinaHealthStatus !== "unknown") {
       parts.push(`国内 ${member.chinaHealthStatus}${member.chinaHealthLatencyMs ? ` / ${member.chinaHealthLatencyMs}ms` : ""}`);
     }
+    parts.push("链路状态在转发规则内判定");
     return parts.join(" / ");
   };
 
@@ -1140,6 +1282,7 @@ export function ForwardGroupsContent({
     const mode = normalizeGroupMode(group.groupMode);
     const templateRuleCount = Number(group.templateRuleCount || 0);
     if (mode === "chain" && templateRuleCount > 0) return `已被 ${templateRuleCount} 条转发规则引用`;
+    if (mode === "failover" || mode === "entry" || mode === "exit") return getGroupConfigState(group).message;
     if (group.lastMessage) return group.lastMessage;
     if (mode === "chain") return "等待转发规则引用";
     if (mode === "entry") return "等待 DDNS 同步";
@@ -1148,13 +1291,14 @@ export function ForwardGroupsContent({
   };
 
   const isGroupMemberActive = (group: any, member: any) => {
-    const mode = normalizeGroupMode(group.groupMode);
     if (member.isEnabled === false) return false;
-    if (mode === "entry" || mode === "exit" || mode === "chain") {
-      const status = String(member.healthStatus || group.lastStatus || "").toLowerCase();
-      return status !== "unhealthy" && status !== "failed" && status !== "down" && status !== "error";
-    }
-    return Number(group.activeMemberId) === Number(member.id);
+    return getGroupConfigState(group).usableMemberIds.has(Number(member.id));
+  };
+
+  const renderMemberConfigIcon = (group: any, member: any) => {
+    if (isGroupMemberActive(group, member)) return <CheckCircle2 className="h-3 w-3 shrink-0" />;
+    if (member.isEnabled === false) return <XCircle className="h-3 w-3 shrink-0" />;
+    return null;
   };
 
   const groupDdnsText = (group: any) => {
@@ -1173,8 +1317,8 @@ export function ForwardGroupsContent({
     const connectHost = String(member.connectHost || "").trim();
     if (!connectHost || member.memberType !== "host") return "";
     const host = hostById.get(Number(member.hostId || 0));
-    if (hostPrivateAddress(host) && connectHost === hostPrivateAddress(host)) return "内网";
-    if (hostIpv6Address(host) && connectHost === hostIpv6Address(host)) return "IPv6";
+    if (hostPrivateAddress(host) && sameAddress(connectHost, hostPrivateAddress(host))) return "内网";
+    if (hostIpv6Address(host) && sameAddress(connectHost, hostIpv6Address(host))) return "IPv6";
     return "指定地址";
   };
 
@@ -1370,13 +1514,9 @@ export function ForwardGroupsContent({
                               ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-600"
                               : "border-border bg-muted/20 text-muted-foreground"
                           }`}
-                          title={memberHealthTitle(member)}
+                          title={memberHealthTitle(group, member)}
                         >
-                          {member.healthStatus === "healthy" ? (
-                            <CheckCircle2 className="h-3 w-3 shrink-0" />
-                          ) : member.healthStatus === "unhealthy" ? (
-                            <XCircle className="h-3 w-3 shrink-0" />
-                          ) : null}
+                          {renderMemberConfigIcon(group, member)}
                           <span className="truncate">
                             {memberDecoratedLabel(group, member, index)}
                           </span>
@@ -1447,13 +1587,9 @@ export function ForwardGroupsContent({
                               ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-600"
                               : "border-border bg-muted/20 text-muted-foreground"
                           }`}
-                          title={memberHealthTitle(member)}
+                          title={memberHealthTitle(group, member)}
                         >
-                          {member.healthStatus === "healthy" ? (
-                            <CheckCircle2 className="h-3 w-3 shrink-0" />
-                          ) : member.healthStatus === "unhealthy" ? (
-                            <XCircle className="h-3 w-3 shrink-0" />
-                          ) : null}
+                          {renderMemberConfigIcon(group, member)}
                           <span className="truncate">
                             {memberDecoratedLabel(group, member, index)}
                           </span>
@@ -1532,13 +1668,9 @@ export function ForwardGroupsContent({
                                   ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-600"
                                   : "border-border bg-muted/20 text-muted-foreground"
                               }`}
-                              title={memberHealthTitle(member)}
+                              title={memberHealthTitle(group, member)}
                             >
-                              {member.healthStatus === "healthy" ? (
-                                <CheckCircle2 className="h-3 w-3" />
-                              ) : member.healthStatus === "unhealthy" ? (
-                                <XCircle className="h-3 w-3" />
-                              ) : null}
+                              {renderMemberConfigIcon(group, member)}
                               {memberDecoratedLabel(group, member, index)}
                             </span>
                           ))}
@@ -1705,14 +1837,14 @@ export function ForwardGroupsContent({
             {(form.groupMode === "failover" || form.groupMode === "entry") && <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_minmax(0,220px)]">
               <div className="space-y-1.5">
                 <Input
-                  aria-label="入口健康度检测目标，留空默认 www.189.cn:80"
+                  aria-label="入口健康度 TCPing 目标，留空默认 www.189.cn:80"
                   disabled={!form.chinaHealthCheckEnabled}
                   value={form.chinaHealthCheckTarget}
                   onChange={(e) => setForm({ ...form, chinaHealthCheckTarget: e.target.value })}
-                  placeholder="留空默认 www.189.cn:80"
+                  placeholder="留空默认 www.189.cn:80，IPv6 用 [地址]:端口"
                 />
                 <p className="text-xs text-muted-foreground">
-                  用于剔除不健康入口；至少一个成员可达时整体仍视为可用。
+                  统一使用 TCPing 剔除不健康入口；IPv6 建议填写 [地址]:端口，至少一个成员可达时整体仍视为可用。
                 </p>
               </div>
               <label className="flex h-10 items-center justify-between rounded-md border border-border/60 px-3">
@@ -1829,7 +1961,7 @@ export function ForwardGroupsContent({
                             <label className="flex items-center gap-2 rounded-md border border-border/50 px-2 py-1 text-xs text-muted-foreground">
                               <span>内网</span>
                               <Switch
-                                checked={!!hostPrivateAddress(hostById.get(Number(member.hostId || 0))) && member.connectHost === hostPrivateAddress(hostById.get(Number(member.hostId || 0)))}
+                                checked={!!hostPrivateAddress(hostById.get(Number(member.hostId || 0))) && sameAddress(member.connectHost, hostPrivateAddress(hostById.get(Number(member.hostId || 0))))}
                                 disabled={!hostPrivateAddress(hostById.get(Number(member.hostId || 0)))}
                                 onCheckedChange={(checked) => updateExitMemberUsePrivate(member.key, checked)}
                               />
@@ -1837,7 +1969,7 @@ export function ForwardGroupsContent({
                             <label className="flex items-center gap-2 rounded-md border border-border/50 px-2 py-1 text-xs text-muted-foreground">
                               <span>IPv6</span>
                               <Switch
-                                checked={!!hostIpv6Address(hostById.get(Number(member.hostId || 0))) && member.connectHost === hostIpv6Address(hostById.get(Number(member.hostId || 0)))}
+                                checked={!!hostIpv6Address(hostById.get(Number(member.hostId || 0))) && sameAddress(member.connectHost, hostIpv6Address(hostById.get(Number(member.hostId || 0))))}
                                 disabled={!hostIpv6Address(hostById.get(Number(member.hostId || 0)))}
                                 onCheckedChange={(checked) => updateExitMemberUseIpv6(member.key, checked)}
                               />
