@@ -185,6 +185,9 @@ export const users = table("users", {
   twoFactorEnabled: boolean("twoFactorEnabled").notNull().default(false),
   twoFactorSecret: text("twoFactorSecret"),
   twoFactorEnabledAt: epoch("twoFactorEnabledAt"),
+  browserSessionToken: text("browserSessionToken"),
+  mobileSessionToken: text("mobileSessionToken"),
+  telegramSessionToken: text("telegramSessionToken"),
   createdAt: epoch("createdAt").notNull().default(nowDefault()),
   updatedAt: epoch("updatedAt").notNull().default(nowDefault()),
   lastSignedIn: epoch("lastSignedIn").notNull().default(nowDefault()),
@@ -383,6 +386,8 @@ export const tunnels = table("tunnels", {
   exitHostId: int("exitHostId").notNull(),
   mode: varchar("mode", { length: 32 }).notNull().default("tls"), // forwardx | tls | wss | tcp | mtls | mwss | mtcp | nginx_stream
   certDomain: text("certDomain"),
+  certPem: text("certPem"),
+  certKeyPem: text("certKeyPem"),
   secret: text("secret"),
   listenPort: int("listenPort").notNull(),
   rateLimitMbps: int("rateLimitMbps").notNull().default(0),

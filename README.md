@@ -5,7 +5,7 @@
 ForwardX 是一套中文化的多主机转发管理系统。它通过轻量 Agent 管理服务器入口、隧道链路、端口转发规则、端口转发链、入口组/出口组、DDNS 故障转移、用户权限、套餐订阅、余额和流量统计，适合把多台服务器统一组织成可观测、可切换、可授权、可计费的网络入口平台。
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.3.198-brightgreen.svg)](https://github.com/Su-cyber-art/Forwardx/releases)
+[![Version](https://img.shields.io/badge/version-2.3.200-brightgreen.svg)](https://github.com/Su-cyber-art/Forwardx/releases)
 [![Node.js](https://img.shields.io/badge/Node.js-22+-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 
 ## 当前 Fork 说明
@@ -24,7 +24,7 @@ ForwardX 是一套中文化的多主机转发管理系统。它通过轻量 Agen
 
 - 当前仓库：https://github.com/Su-cyber-art/Forwardx
 - GitHub Releases：https://github.com/Su-cyber-art/Forwardx/releases
-- Android APK 最新下载：https://github.com/Su-cyber-art/Forwardx/releases/download/v2.3.198/forwardx-android-v2.3.67.apk
+- Android APK 最新下载：https://github.com/Su-cyber-art/Forwardx/releases/download/v2.3.200/forwardx-android-v2.3.68.apk
 - 原项目仓库：https://github.com/poouo/Forwardx
 
 ## 项目定位
@@ -289,7 +289,7 @@ pnpm check:versions
 ForwardX Android 客户端用于手机端访问面板，登录时填写面板地址、账号和密码即可。
 
 下载地址：
-https://github.com/Su-cyber-art/Forwardx/releases/download/v2.3.198/forwardx-android-v2.3.67.apk
+https://github.com/Su-cyber-art/Forwardx/releases/download/v2.3.200/forwardx-android-v2.3.68.apk
 
 常用命令：
 

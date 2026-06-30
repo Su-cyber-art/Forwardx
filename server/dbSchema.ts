@@ -92,6 +92,7 @@ const tables: TableDef[] = [
       c("telegramLinkedAt", "epoch"), c("telegramLastSeenAt", "epoch"), c("telegramAnnouncementSubscribed", "bool", { notNull: true, default: false }), c("telegramBindCode", "text"),
       c("telegramBindCodeExpiresAt", "epoch"), c("telegramLoginCode", "text"), c("telegramLoginCodeExpiresAt", "epoch"),
       c("twoFactorEnabled", "bool", { notNull: true, default: false }), c("twoFactorSecret", "text"), c("twoFactorEnabledAt", "epoch"),
+      c("browserSessionToken", "text"), c("mobileSessionToken", "text"), c("telegramSessionToken", "text"),
       c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" }),
       c("lastSignedIn", "epoch", { notNull: true, default: "now" }),
     ],
@@ -198,6 +199,7 @@ const tables: TableDef[] = [
     columns: [
       c("id", "id"), c("name", "text", { notNull: true }), c("entryGroupId", "int"), c("entryHostId", "int", { notNull: true }),
       c("exitHostId", "int", { notNull: true }), c("mode", "varchar", { length: 32, notNull: true, default: "tls" }), c("certDomain", "text"),
+      c("certPem", "text"), c("certKeyPem", "text"),
       c("secret", "text"), c("listenPort", "int", { notNull: true }), c("rateLimitMbps", "int", { notNull: true, default: 0 }), c("portRangeStart", "int"), c("portRangeEnd", "int"),
       c("networkType", "varchar", { length: 32, notNull: true, default: "public" }), c("connectHost", "text"),
       c("blockHttp", "bool", { notNull: true, default: false }), c("blockSocks", "bool", { notNull: true, default: false }),
