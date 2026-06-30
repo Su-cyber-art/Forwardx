@@ -226,6 +226,7 @@ type RuleFormData = {
   sourcePort: number;
   targetIp: string;
   targetPort: number;
+  telegramErrorNotifyEnabled: boolean;
   blockHttp: boolean;
   blockSocks: boolean;
   blockTls: boolean;
@@ -290,6 +291,7 @@ const defaultForm: RuleFormData = {
   sourcePort: 0,
   targetIp: "",
   targetPort: 0,
+  telegramErrorNotifyEnabled: false,
   blockHttp: false,
   blockSocks: false,
   blockTls: false,
@@ -311,6 +313,7 @@ const defaultForm: RuleFormData = {
 };
 
 const gostTunnelModes = new Set(["tls", "wss", "tcp", "mtls", "mwss", "mtcp"]);
+const nginxTunnelModes = new Set(["nginx_stream", "nginx_tls"]);
 const unsupportedProtocolTitle = "当前不支持，请联系管理员";
 const desktopRuleTypeLabels = {
   local: "端口转发",
@@ -328,7 +331,6 @@ const ruleTypeDescriptions = {
 type RuleViewMode = "card" | "table" | "globe";
 type RuleCardSize = "standard" | "compact";
 type RuleDisplayMode = RuleCardSize | "table" | "globe";
-type RuleTrafficRange = "24h" | "total";
 type RulePageSize = 12 | 24 | 36 | 48;
 type RuleGroupType = keyof typeof desktopRuleTypeLabels;
 type RuleGroupCollapsedState = Partial<Record<RuleGroupType, boolean>>;
@@ -361,6 +363,7 @@ type RuleTransferFileRule = {
   sourcePort: number;
   targetIp: string;
   targetPort: number;
+  telegramErrorNotifyEnabled?: boolean;
   proxyProtocolReceive: boolean;
   proxyProtocolSend: boolean;
   proxyProtocolExitReceive: boolean;
@@ -793,6 +796,13 @@ function getTunnelDisplay(tunnel: any | null | undefined) {
       shortLabel: "gost",
       badgeLabel: "隧道 / gost",
       toolLabel: "GOST 隧道",
+    };
+  }
+  if (nginxTunnelModes.has(mode)) {
+    return {
+      shortLabel: "Nginx",
+      badgeLabel: "隧道 / Nginx",
+      toolLabel: "Nginx Stream 隧道",
     };
   }
   return {
@@ -1990,6 +2000,7 @@ function exportRuleForTransfer(rule: any): RuleTransferFileRule {
     sourcePort: Number(rule?.sourcePort || 0),
     targetIp: String(rule?.targetIp || ""),
     targetPort: Number(rule?.targetPort || 0),
+    telegramErrorNotifyEnabled: Boolean(rule?.telegramErrorNotifyEnabled),
     proxyProtocolReceive: Boolean(rule?.proxyProtocolReceive),
     proxyProtocolSend: Boolean(rule?.proxyProtocolSend),
     proxyProtocolExitReceive: Boolean(rule?.proxyProtocolExitReceive),
@@ -2025,6 +2036,7 @@ function normalizeRuleTransferRule(raw: unknown): RuleTransferFileRule | null {
     sourcePort,
     targetIp,
     targetPort,
+    telegramErrorNotifyEnabled: Boolean(source.telegramErrorNotifyEnabled),
     proxyProtocolReceive: Boolean(source.proxyProtocolReceive),
     proxyProtocolSend: Boolean(source.proxyProtocolSend),
     proxyProtocolExitReceive: Boolean(source.proxyProtocolExitReceive),
@@ -2115,7 +2127,7 @@ function RulesContent() {
     staleTime: 10000,
     refetchOnWindowFocus: false,
   });
-  const { data: systemSettings } = trpc.system.getSettings.useQuery(undefined, {
+  const { data: systemSettings, isFetched: systemSettingsFetched } = trpc.system.getSettings.useQuery(undefined, {
     enabled: secondaryQueriesReady,
     staleTime: 60000,
     refetchOnWindowFocus: false,
@@ -2149,7 +2161,6 @@ function RulesContent() {
   const [ruleCardSize, setRuleCardSize] = useState<RuleCardSize>(() => getStoredRuleCardSize());
   const effectiveViewMode: RuleViewMode = isMobile ? "card" : viewMode;
   const effectiveRuleCardSize: RuleCardSize = isMobile ? "standard" : ruleCardSize;
-  const [trafficRange, setTrafficRange] = useState<RuleTrafficRange>("24h");
   const [rulePageSize, setRulePageSize] = useState<RulePageSize>(() =>
     getStoredRulePageSize(getStoredRuleCardSize() === "compact" ? 24 : 12)
   );
@@ -2389,6 +2400,7 @@ function RulesContent() {
       sourcePort: rule.sourcePort,
       targetIp: rule.targetIp,
       targetPort: rule.targetPort,
+      telegramErrorNotifyEnabled: !!rule.telegramErrorNotifyEnabled,
       blockHttp: false,
       blockSocks: false,
       blockTls: false,
@@ -2442,7 +2454,8 @@ function RulesContent() {
   }, [forwardProtocolSettings]);
   const getTunnelProtocolKey = useCallback((tunnel: any | null | undefined): ForwardProtocolKey | null => {
     const mode = String(tunnel?.mode || "").toLowerCase();
-    return (["forwardx", "tls", "wss", "tcp", "mtls", "mwss", "mtcp"] as const).includes(mode as any)
+    if (mode === "nginx_tls") return "nginx_stream";
+    return (["forwardx", "tls", "wss", "tcp", "mtls", "mwss", "mtcp", "nginx_stream", "nginx_tls"] as const).includes(mode as any)
       ? mode as ForwardProtocolKey
       : null;
   }, []);
@@ -2619,6 +2632,7 @@ function RulesContent() {
   const canUseFailoverGroup = availableFailoverForwardGroups.length > 0;
   const canCreateRule = canUseLocalForward || canUseGost || canUseForwardChain || canUseFailoverGroup;
   const isForwardGroupRouteMode = isForwardGroupRouteModeValue(form.routeMode);
+  const telegramBotReady = !!systemSettings?.telegram?.enabled && !!systemSettings?.telegram?.configured;
   const selectedForwardGroupIsChain = form.routeMode === "chain" || isForwardChainGroup(selectedForwardGroup);
   const mainBackupForwardType = form.routeMode === "tunnel" || (!selectedForwardGroupIsChain && selectedForwardGroup?.groupType === "tunnel") ? "gost" : form.forwardType;
   const mainBackupIsTunnelRoute = form.routeMode === "tunnel" || (!selectedForwardGroupIsChain && selectedForwardGroup?.groupType === "tunnel");
@@ -2777,6 +2791,12 @@ function RulesContent() {
     if (!form.failoverEnabled || canUseMainBackup) return;
     setForm((prev) => ({ ...prev, failoverEnabled: false }));
   }, [canUseMainBackup, form.failoverEnabled]);
+
+  useEffect(() => {
+    if (!systemSettingsFetched) return;
+    if (telegramBotReady || !form.telegramErrorNotifyEnabled) return;
+    setForm((prev) => prev.telegramErrorNotifyEnabled ? { ...prev, telegramErrorNotifyEnabled: false } : prev);
+  }, [form.telegramErrorNotifyEnabled, systemSettingsFetched, telegramBotReady]);
 
   useEffect(() => {
     if (canUseProxyProtocol) return;
@@ -2967,6 +2987,10 @@ function RulesContent() {
       toast.error("目标端口必须在 1-65535 之间");
       return;
     }
+    if (form.telegramErrorNotifyEnabled && !telegramBotReady) {
+      toast.error("请先在系统设置中配置并启用 Telegram 机器人，再开启异常TG提醒");
+      return;
+    }
     if ((form.proxyProtocolReceive || form.proxyProtocolSend || form.proxyProtocolExitReceive || form.proxyProtocolExitSend) && !canUseProxyProtocol) {
       toast.error(proxyProtocolDisabledText || "当前规则不支持 PROXY Protocol");
       return;
@@ -3047,6 +3071,7 @@ function RulesContent() {
         isEnabled: portStatus === "available" ? true : undefined,
         targetIp: form.targetIp,
         targetPort: form.targetPort,
+        telegramErrorNotifyEnabled: form.telegramErrorNotifyEnabled,
         ...proxyProtocolPayload,
         ...transportTuningPayload,
         ...failoverPayload,
@@ -3065,6 +3090,7 @@ function RulesContent() {
         sourcePort: form.sourcePort,
         targetIp: form.targetIp,
         targetPort: form.targetPort,
+        telegramErrorNotifyEnabled: form.telegramErrorNotifyEnabled,
         ...proxyProtocolPayload,
         ...transportTuningPayload,
         ...failoverPayload,
@@ -3159,22 +3185,13 @@ function RulesContent() {
     });
     return map;
   }, [ruleTargetGeoRows]);
-  const trafficRangeLabel = trafficRange === "total" ? "累计" : "近 24h";
-  const trafficMetricHeaderLabel = trafficRange === "total" ? "累计流量 / 延迟" : "总量 / 24h 流量 / 延迟";
+  const trafficRangeLabel = "近 24h";
+  const trafficMetricHeaderLabel = "累计 / 24H / 延迟";
 
-  const { data: trafficSummary } = trpc.rules.trafficSummary.useQuery(
-    { hours: 24, range: trafficRange, ruleIds: visibleRuleIdsForMetrics },
-    {
-      enabled: secondaryQueriesReady && visibleRuleIdsForMetrics.length > 0,
-      refetchInterval: 15000,
-      staleTime: 5000,
-      refetchOnWindowFocus: false,
-    }
-  );
   const { data: totalTrafficSummary } = trpc.rules.trafficSummary.useQuery(
     { hours: 24, range: "total", ruleIds: visibleRuleIdsForMetrics },
     {
-      enabled: secondaryQueriesReady && trafficRange !== "total" && visibleRuleIdsForMetrics.length > 0,
+      enabled: secondaryQueriesReady && visibleRuleIdsForMetrics.length > 0,
       refetchInterval: 15000,
       staleTime: 5000,
       refetchOnWindowFocus: false,
@@ -3183,19 +3200,17 @@ function RulesContent() {
   const { data: dailyTrafficSummary } = trpc.rules.trafficSummary.useQuery(
     { hours: 24, range: "24h", ruleIds: visibleRuleIdsForMetrics },
     {
-      enabled: secondaryQueriesReady && trafficRange === "total" && visibleRuleIdsForMetrics.length > 0,
+      enabled: secondaryQueriesReady && visibleRuleIdsForMetrics.length > 0,
       refetchInterval: 15000,
       staleTime: 5000,
       refetchOnWindowFocus: false,
     }
   );
-  const [stableTrafficSummaryRows, setStableTrafficSummaryRows] = useState<any[]>([]);
   const [stableTotalTrafficSummaryRows, setStableTotalTrafficSummaryRows] = useState<any[]>([]);
   const [stableDailyTrafficSummaryRows, setStableDailyTrafficSummaryRows] = useState<any[]>([]);
   const resetTrafficMutation = trpc.rules.resetTraffic.useMutation({
     onSuccess: async () => {
       clearRuleTrafficStatCaches();
-      setStableTrafficSummaryRows([]);
       setStableTotalTrafficSummaryRows([]);
       setStableDailyTrafficSummaryRows([]);
       await Promise.all([
@@ -3211,38 +3226,26 @@ function RulesContent() {
     },
     onError: (err) => toast.error(err.message || "重置流量失败"),
   });
-  useEffect(() => { setStableTrafficSummaryRows([]); }, [trafficRange]);
   useEffect(() => {
-    if (!filteredRulesPrimed) return;
     if (visibleRuleIdsForMetrics.length === 0) {
-      setStableTrafficSummaryRows([]);
-      return;
-    }
-    if (trafficSummary) {
-      setStableTrafficSummaryRows(trafficSummary);
-    }
-  }, [filteredRulesPrimed, trafficSummary, trafficRange, visibleRuleIdsForMetrics.length]);
-  useEffect(() => {
-    if (trafficRange === "total" || visibleRuleIdsForMetrics.length === 0) {
       setStableTotalTrafficSummaryRows([]);
       return;
     }
     if (totalTrafficSummary) {
       setStableTotalTrafficSummaryRows(totalTrafficSummary);
     }
-  }, [totalTrafficSummary, trafficRange, visibleRuleIdsForMetrics.length]);
+  }, [totalTrafficSummary, visibleRuleIdsForMetrics.length]);
   useEffect(() => {
-    if (trafficRange !== "total" || visibleRuleIdsForMetrics.length === 0) {
+    if (visibleRuleIdsForMetrics.length === 0) {
       setStableDailyTrafficSummaryRows([]);
       return;
     }
     if (dailyTrafficSummary) {
       setStableDailyTrafficSummaryRows(dailyTrafficSummary);
     }
-  }, [dailyTrafficSummary, trafficRange, visibleRuleIdsForMetrics.length]);
-  const trafficSummaryRows = visibleRuleIdsForMetrics.length === 0 ? [] : trafficSummary ?? stableTrafficSummaryRows;
-  const totalTrafficSummaryRows = trafficRange === "total" || visibleRuleIdsForMetrics.length === 0 ? [] : totalTrafficSummary ?? stableTotalTrafficSummaryRows;
-  const dailyTrafficSummaryRows = trafficRange === "24h" || visibleRuleIdsForMetrics.length === 0 ? trafficSummaryRows : dailyTrafficSummary ?? stableDailyTrafficSummaryRows;
+  }, [dailyTrafficSummary, visibleRuleIdsForMetrics.length]);
+  const totalTrafficSummaryRows = visibleRuleIdsForMetrics.length === 0 ? [] : totalTrafficSummary ?? stableTotalTrafficSummaryRows;
+  const dailyTrafficSummaryRows = visibleRuleIdsForMetrics.length === 0 ? [] : dailyTrafficSummary ?? stableDailyTrafficSummaryRows;
   const trafficByRule = useMemo(() => {
     const m = new Map<number, {
       bytesIn: number;
@@ -3252,7 +3255,7 @@ function RulesContent() {
       latestLatencyIsTimeout: boolean;
       latestLatencyAt: Date | string | null;
     }>();
-    trafficSummaryRows.forEach((t: any) => {
+    dailyTrafficSummaryRows.forEach((t: any) => {
       const rid = Number(t.ruleId);
       const prev = m.get(rid);
       if (prev) {
@@ -3278,7 +3281,7 @@ function RulesContent() {
       }
     });
     return m;
-  }, [trafficSummaryRows]);
+  }, [dailyTrafficSummaryRows]);
   const dailyTrafficByRule = useMemo(() => {
     const m = new Map<number, { bytesIn: number; bytesOut: number }>();
     dailyTrafficSummaryRows.forEach((t: any) => {
@@ -3297,33 +3300,46 @@ function RulesContent() {
     return m;
   }, [dailyTrafficSummaryRows]);
   const totalTrafficByRule = useMemo(() => {
-    const m = new Map<number, { bytesIn: number; bytesOut: number }>();
+    const m = new Map<number, { bytesIn: number; bytesOut: number; connections: number }>();
     totalTrafficSummaryRows.forEach((t: any) => {
       const rid = Number(t.ruleId);
       const prev = m.get(rid);
       if (prev) {
         prev.bytesIn += Number(t.bytesIn) || 0;
         prev.bytesOut += Number(t.bytesOut) || 0;
+        prev.connections += Number(t.connections) || 0;
       } else {
         m.set(rid, {
           bytesIn: Number(t.bytesIn) || 0,
           bytesOut: Number(t.bytesOut) || 0,
+          connections: Number(t.connections) || 0,
         });
       }
     });
     return m;
   }, [totalTrafficSummaryRows]);
-  const trafficTotals = useMemo(() => {
+  const dailyTrafficTotals = useMemo(() => {
     let bytesIn = 0;
     let bytesOut = 0;
     let connections = 0;
-    trafficSummaryRows.forEach((t: any) => {
+    dailyTrafficSummaryRows.forEach((t: any) => {
       bytesIn += Number(t.bytesIn) || 0;
       bytesOut += Number(t.bytesOut) || 0;
       connections += Number(t.connections) || 0;
     });
     return { bytesIn, bytesOut, connections };
-  }, [trafficSummaryRows]);
+  }, [dailyTrafficSummaryRows]);
+  const totalTrafficTotals = useMemo(() => {
+    let bytesIn = 0;
+    let bytesOut = 0;
+    let connections = 0;
+    totalTrafficSummaryRows.forEach((t: any) => {
+      bytesIn += Number(t.bytesIn) || 0;
+      bytesOut += Number(t.bytesOut) || 0;
+      connections += Number(t.connections) || 0;
+    });
+    return { bytesIn, bytesOut, connections };
+  }, [totalTrafficSummaryRows]);
   const sortedFilteredRules = useMemo(() => {
     return [...filteredRules].sort((a: any, b: any) => {
       const aHostId = getRuleEntryHostIdForSort(a);
@@ -3346,15 +3362,15 @@ function RulesContent() {
       filterHost,
       ruleCategory,
       ruleSearchQuery.trim() || "search-all",
-      trafficRange,
     ].join("."),
-    [filterHost, ruleCategory, ruleSearchQuery, trafficRange, filterUser, user?.id, user?.role],
+    [filterHost, ruleCategory, ruleSearchQuery, filterUser, user?.id, user?.role],
   );
-  const trafficTotalsLastCacheScope = `${user?.role === "admin" ? "admin" : `user-${user?.id || "self"}`}.${trafficRange}`;
+  const trafficTotalsLastCacheScope = `${user?.role === "admin" ? "admin" : `user-${user?.id || "self"}`}`;
   const hasActiveUserFilter = user?.role === "admin" && filterUser !== "self";
   const hasActiveRuleFilter = hasActiveUserFilter || filterHost !== "all" || ruleCategory !== "all" || ruleSearchQuery.trim().length > 0;
   const rulesHeaderLoading = isLoading || !rules || !scopedRulesReady || !filteredRulesPrimed;
-  const trafficTotalsLoading = rulesHeaderLoading || (visibleRuleIdsForMetrics.length > 0 && (!secondaryQueriesReady || (!trafficSummary && stableTrafficSummaryRows.length === 0)));
+  const totalTrafficTotalsLoading = rulesHeaderLoading || (visibleRuleIdsForMetrics.length > 0 && (!secondaryQueriesReady || (!totalTrafficSummary && stableTotalTrafficSummaryRows.length === 0)));
+  const dailyTrafficTotalsLoading = rulesHeaderLoading || (visibleRuleIdsForMetrics.length > 0 && (!secondaryQueriesReady || (!dailyTrafficSummary && stableDailyTrafficSummaryRows.length === 0)));
   const activeCount = useMemo(
     () => filteredRules.filter((r: any) => r.isEnabled && isRuleSupported(r)).length,
     [filteredRules, isRuleSupported]
@@ -4028,6 +4044,7 @@ function RulesContent() {
       sourcePort: rule.sourcePort,
       targetIp: rule.targetIp,
       targetPort: rule.targetPort,
+      telegramErrorNotifyEnabled: telegramBotReady && !!rule.telegramErrorNotifyEnabled,
       proxyProtocolReceive: rule.proxyProtocolReceive,
       proxyProtocolSend: rule.proxyProtocolSend,
       proxyProtocolExitReceive: rule.proxyProtocolExitReceive,
@@ -4399,55 +4416,46 @@ function RulesContent() {
       </Badge>
     ) : null;
 
-    if (compact) {
-      return (
-        <div className="flex min-w-0 flex-wrap items-center gap-1.5 font-mono text-xs">
-          {entryAddresses.map((entry) => (
-            <button
-              key={`${entry.label}:${entry.value}`}
-              type="button"
-              onClick={() => copyEntryAddress(rule, entry.value)}
-              className="group inline-flex max-w-full min-w-0 items-center gap-1 rounded bg-muted/40 px-1.5 py-0.5 transition-colors hover:bg-muted/70"
-              title={`${entryTitle}${entryAddresses.length > 1 ? ` (${entry.label})` : ""}`}
-            >
-              <code className="truncate">{entry.text}</code>
-              <Copy className="h-3 w-3 flex-shrink-0 text-muted-foreground opacity-60 group-hover:opacity-100" />
-            </button>
-          ))}
-          <ArrowRight className="h-3 w-3 flex-shrink-0 text-muted-foreground" />
-          <code className="max-w-full truncate rounded bg-muted/40 px-1.5 py-0.5" title={targetAddress}>
-            {targetAddress}
-          </code>
-          {failoverBadge}
-        </div>
-      );
-    }
+    const panelClass = compact
+      ? "rounded-md border border-border/50 bg-background/55 px-2 py-1.5"
+      : "rounded-md border border-border/50 bg-background/55 px-2.5 py-2";
+    const labelClass = "mb-1 flex items-center gap-1 text-[10px] font-medium text-muted-foreground";
+    const valueClass = compact
+      ? "min-w-0 break-all text-[11px] leading-4"
+      : "min-w-0 break-all text-xs leading-5";
 
     return (
-      <div className="min-w-0 space-y-1 font-mono text-xs">
-        <div className="flex min-w-0 items-center gap-1.5">
-          <span className="shrink-0 text-[10px] text-muted-foreground">入口</span>
-          <div className="flex min-w-0 flex-1 flex-wrap gap-1">
+      <div className="min-w-0 space-y-1.5 font-mono text-xs">
+        <div className={panelClass}>
+          <div className={labelClass}>入口</div>
+          <div className="flex min-w-0 flex-col gap-1">
             {entryAddresses.map((entry) => (
               <button
                 key={`${entry.label}:${entry.value}`}
                 type="button"
                 onClick={() => copyEntryAddress(rule, entry.value)}
-                className="group inline-flex max-w-full min-w-0 items-center gap-1 rounded bg-muted/40 px-1.5 py-0.5 transition-colors hover:bg-muted/70"
+                className="group flex max-w-full min-w-0 items-start justify-between gap-1.5 rounded bg-muted/35 px-1.5 py-1 text-left transition-colors hover:bg-muted/70"
                 title={`${entryTitle}${entryAddresses.length > 1 ? ` (${entry.label})` : ""}`}
               >
-                <code className="min-w-0 break-all leading-4">{entry.text}</code>
-                <Copy className="h-3 w-3 flex-shrink-0 text-muted-foreground opacity-60 group-hover:opacity-100" />
+                <code className={valueClass}>{entry.text}</code>
+                <Copy className="mt-0.5 h-3 w-3 flex-shrink-0 text-muted-foreground opacity-60 group-hover:opacity-100" />
               </button>
             ))}
           </div>
         </div>
-        <div className="flex min-w-0 items-center gap-1.5">
-          <span className="shrink-0 text-[10px] text-muted-foreground">出口</span>
-          <code className="inline-block max-w-full break-all rounded bg-muted/40 px-1.5 py-0.5 leading-4" title={targetAddress}>
-            {targetAddress}
-          </code>
-          {failoverBadge}
+        <div className="flex justify-center">
+          <span className="inline-flex h-5 w-5 items-center justify-center rounded-full border border-border/50 bg-background text-muted-foreground shadow-sm">
+            <ArrowDownToLine className="h-3 w-3" />
+          </span>
+        </div>
+        <div className={panelClass}>
+          <div className={labelClass}>出口</div>
+          <div className="flex min-w-0 items-start gap-1.5">
+            <code className={`${valueClass} flex-1 rounded bg-muted/35 px-1.5 py-1`} title={targetAddress}>
+              {targetAddress}
+            </code>
+            {failoverBadge}
+          </div>
         </div>
       </div>
     );
@@ -4603,24 +4611,20 @@ function RulesContent() {
   );
 
   const renderRuleTraffic = (rule: any) => {
-    const t = trafficByRule.get(rule.id);
+    const t = dailyTrafficByRule.get(rule.id);
     if (!t || (t.bytesIn === 0 && t.bytesOut === 0)) {
       return <span className="text-xs text-muted-foreground">—</span>;
     }
     return (
       <div className="flex flex-col gap-0.5 text-xs leading-5">
-        {renderRuleTrafficValue(rule, "in")}
-        {renderRuleTrafficValue(rule, "out")}
+        {renderRuleDailyTrafficValue(rule, "in")}
+        {renderRuleDailyTrafficValue(rule, "out")}
       </div>
     );
   };
 
-  const getRuleTotalTrafficSource = (rule: any) => (
-    trafficRange === "total" ? trafficByRule.get(rule.id) : totalTrafficByRule.get(rule.id)
-  );
-
   const renderMobileRuleTotalTraffic = (rule: any) => {
-    const t = getRuleTotalTrafficSource(rule);
+    const t = totalTrafficByRule.get(rule.id);
     const total = Number(t?.bytesIn || 0) + Number(t?.bytesOut || 0);
     if (!t || total <= 0) {
       return <span className="text-xs text-muted-foreground">—</span>;
@@ -4637,10 +4641,9 @@ function RulesContent() {
   };
 
   const renderRuleTotalTraffic = (rule: any) => {
-    if (trafficRange === "total") return null;
     const t = totalTrafficByRule.get(rule.id);
     if (!t) {
-      return <span className="text-xs text-muted-foreground">总量 —</span>;
+      return <span className="text-xs text-muted-foreground">累计 —</span>;
     }
     const total = Number(t.bytesIn || 0) + Number(t.bytesOut || 0);
     return (
@@ -4649,10 +4652,21 @@ function RulesContent() {
         title={`累计入向 ${formatBytes(t.bytesIn)} / 出向 ${formatBytes(t.bytesOut)}`}
       >
         <ArrowRightLeft className="h-3 w-3 shrink-0 text-muted-foreground" />
-        总 {formatBytes(total)}
+        累计 {formatBytes(total)}
       </span>
     );
   };
+
+  const renderRuleCombinedTraffic = (rule: any) => (
+    <div className="space-y-1 whitespace-nowrap">
+      {renderRuleTotalTraffic(rule)}
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+        <span className="text-xs text-muted-foreground">24H</span>
+        {renderRuleTraffic(rule)}
+      </div>
+      {renderLatestLatency(rule)}
+    </div>
+  );
 
   const renderLatestLatency = (rule: any) => {
     const t = trafficByRule.get(rule.id);
@@ -4866,11 +4880,7 @@ function RulesContent() {
           <Badge variant="secondary" className="whitespace-nowrap text-[10px]">{formatForwardRuleProtocol(rule.protocol)}</Badge>
         </TableCell>
         <TableCell className="pr-5">
-          <div className="space-y-0.5 whitespace-nowrap">
-            {renderRuleTotalTraffic(rule)}
-            {renderRuleTraffic(rule)}
-            {renderLatestLatency(rule)}
-          </div>
+          {renderRuleCombinedTraffic(rule)}
         </TableCell>
         <TableCell className="text-center">
           {supported ? (
@@ -4924,7 +4934,7 @@ function RulesContent() {
               )}
             </div>
 
-            <div className="rounded-md bg-muted/25 p-1.5">
+            <div className="min-w-0">
               {renderTransfer(rule, true)}
             </div>
 
@@ -4945,6 +4955,20 @@ function RulesContent() {
                 {rule.protocolBlockReason}
               </div>
             )}
+
+            <div className="grid grid-cols-[minmax(0,1fr)_auto] items-end gap-2 border-t border-border/40 pt-1.5 text-xs">
+              <div className="min-w-0">
+                <div className="mb-0.5 text-[10px] text-muted-foreground">累计流量</div>
+                {renderMobileRuleTotalTraffic(rule)}
+              </div>
+              <div className="min-w-0 text-right">
+                <div className="mb-0.5 text-[10px] text-muted-foreground">24H</div>
+                <div className="flex flex-wrap justify-end gap-x-2 gap-y-0.5">
+                  {renderRuleDailyTrafficValue(rule, "in")}
+                  {renderRuleDailyTrafficValue(rule, "out")}
+                </div>
+              </div>
+            </div>
 
             <div className="flex justify-end border-t border-border/40 pt-1.5">
               {renderRuleActions(rule)}
@@ -4997,7 +5021,7 @@ function RulesContent() {
             )}
           </div>
 
-          <div className="rounded-md bg-muted/25 p-2">
+          <div className="min-w-0">
             {renderTransfer(rule, true)}
           </div>
           <div className="grid grid-cols-2 gap-3 text-xs">
@@ -5257,81 +5281,113 @@ function RulesContent() {
       )}
 
       {/* 转发流量汇总 */}
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div className="inline-flex w-full overflow-hidden rounded-md border border-border/40 sm:w-auto">
-          <Button
-            type="button"
-            variant={trafficRange === "total" ? "secondary" : "ghost"}
-            size="sm"
-            className="h-8 flex-1 rounded-none px-3 text-xs sm:flex-none"
-            onClick={() => setTrafficRange("total")}
-          >
-            当前累计
-          </Button>
-          <Button
-            type="button"
-            variant={trafficRange === "24h" ? "secondary" : "ghost"}
-            size="sm"
-            className="h-8 flex-1 rounded-none border-l border-border/40 px-3 text-xs sm:flex-none"
-            onClick={() => setTrafficRange("24h")}
-          >
-            24h
-          </Button>
-        </div>
-      </div>
       <div className="grid grid-cols-3 gap-2 sm:gap-4">
         <Card className="border-border/40">
-          <CardContent className="flex min-w-0 items-center justify-between gap-2 p-3 sm:p-4">
-            <div className="min-w-0">
-              <p className="text-[10px] sm:text-xs text-muted-foreground">{trafficRangeLabel} 入向</p>
-              <AnimatedStatValue
-                as="p"
-                value={formatBytes(trafficTotals.bytesIn)}
-                loading={trafficTotalsLoading}
-                cacheKey={`rules.traffic.${trafficTotalsCacheScope}.bytesIn`}
-                fallbackCacheKeys={[`rules.traffic.${trafficTotalsLastCacheScope}.last.bytesIn`, "rules.traffic.last.bytesIn"]}
-                mirrorCacheKeys={[`rules.traffic.${trafficTotalsLastCacheScope}.last.bytesIn`, "rules.traffic.last.bytesIn"]}
-                fallbackValue="0 B"
-                className="mt-0.5 truncate text-xs font-semibold tabular-nums sm:mt-1 sm:text-xl"
-              />
+          <CardContent className="flex min-w-0 items-center justify-between gap-2 p-3 sm:gap-3 sm:p-4">
+            <div className="min-w-0 flex-1">
+              <p className="text-[10px] sm:text-xs text-muted-foreground">入向流量</p>
+              <div className="mt-0.5 flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
+                <div className="inline-flex min-w-0 items-baseline gap-1">
+                  <span className="text-[9px] font-medium uppercase text-muted-foreground sm:text-[10px]">累计</span>
+                  <AnimatedStatValue
+                    as="span"
+                    value={formatBytes(totalTrafficTotals.bytesIn)}
+                    loading={totalTrafficTotalsLoading}
+                    cacheKey={`rules.traffic.${trafficTotalsCacheScope}.total.bytesIn`}
+                    fallbackCacheKeys={[`rules.traffic.${trafficTotalsLastCacheScope}.total.last.bytesIn`, "rules.traffic.total.last.bytesIn"]}
+                    mirrorCacheKeys={[`rules.traffic.${trafficTotalsLastCacheScope}.total.last.bytesIn`, "rules.traffic.total.last.bytesIn"]}
+                    fallbackValue="0 B"
+                    className="truncate text-xs font-semibold tabular-nums sm:text-xl"
+                  />
+                </div>
+                <div className="inline-flex min-w-0 items-baseline gap-1">
+                  <span className="text-[9px] font-medium uppercase text-muted-foreground sm:text-[10px]">24H</span>
+                  <AnimatedStatValue
+                    as="span"
+                    value={formatBytes(dailyTrafficTotals.bytesIn)}
+                    loading={dailyTrafficTotalsLoading}
+                    cacheKey={`rules.traffic.${trafficTotalsCacheScope}.daily.bytesIn`}
+                    fallbackCacheKeys={[`rules.traffic.${trafficTotalsLastCacheScope}.daily.last.bytesIn`, "rules.traffic.daily.last.bytesIn"]}
+                    mirrorCacheKeys={[`rules.traffic.${trafficTotalsLastCacheScope}.daily.last.bytesIn`, "rules.traffic.daily.last.bytesIn"]}
+                    fallbackValue="0 B"
+                    className="truncate text-[10px] font-semibold tabular-nums text-foreground sm:text-xs"
+                  />
+                </div>
+              </div>
             </div>
-            <ArrowDownToLine className="hidden h-4 w-4 shrink-0 text-chart-2 sm:block sm:h-6 sm:w-6" />
+            <ArrowDownToLine className="h-5 w-5 shrink-0 text-chart-2 sm:h-6 sm:w-6" />
           </CardContent>
         </Card>
         <Card className="border-border/40">
-          <CardContent className="flex min-w-0 items-center justify-between gap-2 p-3 sm:p-4">
-            <div className="min-w-0">
-              <p className="text-[10px] sm:text-xs text-muted-foreground">{trafficRangeLabel} 出向</p>
-              <AnimatedStatValue
-                as="p"
-                value={formatBytes(trafficTotals.bytesOut)}
-                loading={trafficTotalsLoading}
-                cacheKey={`rules.traffic.${trafficTotalsCacheScope}.bytesOut`}
-                fallbackCacheKeys={[`rules.traffic.${trafficTotalsLastCacheScope}.last.bytesOut`, "rules.traffic.last.bytesOut"]}
-                mirrorCacheKeys={[`rules.traffic.${trafficTotalsLastCacheScope}.last.bytesOut`, "rules.traffic.last.bytesOut"]}
-                fallbackValue="0 B"
-                className="mt-0.5 truncate text-xs font-semibold tabular-nums sm:mt-1 sm:text-xl"
-              />
+          <CardContent className="flex min-w-0 items-center justify-between gap-3 p-3 sm:gap-4 sm:p-4">
+            <div className="min-w-0 flex-1">
+              <p className="text-[10px] sm:text-xs text-muted-foreground">出向流量</p>
+              <div className="mt-0.5 flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
+                <div className="inline-flex min-w-0 items-baseline gap-1">
+                  <span className="text-[9px] font-medium uppercase text-muted-foreground sm:text-[10px]">累计</span>
+                  <AnimatedStatValue
+                    as="span"
+                    value={formatBytes(totalTrafficTotals.bytesOut)}
+                    loading={totalTrafficTotalsLoading}
+                    cacheKey={`rules.traffic.${trafficTotalsCacheScope}.total.bytesOut`}
+                    fallbackCacheKeys={[`rules.traffic.${trafficTotalsLastCacheScope}.total.last.bytesOut`, "rules.traffic.total.last.bytesOut"]}
+                    mirrorCacheKeys={[`rules.traffic.${trafficTotalsLastCacheScope}.total.last.bytesOut`, "rules.traffic.total.last.bytesOut"]}
+                    fallbackValue="0 B"
+                    className="truncate text-xs font-semibold tabular-nums sm:text-xl"
+                  />
+                </div>
+                <div className="inline-flex min-w-0 items-baseline gap-1">
+                  <span className="text-[9px] font-medium uppercase text-muted-foreground sm:text-[10px]">24H</span>
+                  <AnimatedStatValue
+                    as="span"
+                    value={formatBytes(dailyTrafficTotals.bytesOut)}
+                    loading={dailyTrafficTotalsLoading}
+                    cacheKey={`rules.traffic.${trafficTotalsCacheScope}.daily.bytesOut`}
+                    fallbackCacheKeys={[`rules.traffic.${trafficTotalsLastCacheScope}.daily.last.bytesOut`, "rules.traffic.daily.last.bytesOut"]}
+                    mirrorCacheKeys={[`rules.traffic.${trafficTotalsLastCacheScope}.daily.last.bytesOut`, "rules.traffic.daily.last.bytesOut"]}
+                    fallbackValue="0 B"
+                    className="truncate text-[10px] font-semibold tabular-nums text-foreground sm:text-xs"
+                  />
+                </div>
+              </div>
             </div>
-            <ArrowUpFromLine className="hidden h-4 w-4 shrink-0 text-chart-4 sm:block sm:h-6 sm:w-6" />
+            <ArrowUpFromLine className="h-5 w-5 shrink-0 text-chart-4 sm:h-6 sm:w-6" />
           </CardContent>
         </Card>
         <Card className="border-border/40">
-          <CardContent className="flex min-w-0 items-center justify-between gap-2 p-3 sm:p-4">
-            <div className="min-w-0">
-              <p className="text-[10px] sm:text-xs text-muted-foreground">{trafficRangeLabel} 连接</p>
-              <AnimatedStatValue
-                as="p"
-                value={trafficTotals.connections.toLocaleString()}
-                loading={trafficTotalsLoading}
-                cacheKey={`rules.traffic.${trafficTotalsCacheScope}.connections`}
-                fallbackCacheKeys={[`rules.traffic.${trafficTotalsLastCacheScope}.last.connections`, "rules.traffic.last.connections"]}
-                mirrorCacheKeys={[`rules.traffic.${trafficTotalsLastCacheScope}.last.connections`, "rules.traffic.last.connections"]}
-                fallbackValue="0"
-                className="mt-0.5 truncate text-xs font-semibold tabular-nums sm:mt-1 sm:text-xl"
-              />
+          <CardContent className="flex min-w-0 items-center justify-between gap-3 p-3 sm:gap-4 sm:p-4">
+            <div className="min-w-0 flex-1">
+              <p className="text-[10px] sm:text-xs text-muted-foreground">连接次数</p>
+              <div className="mt-0.5 flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
+                <div className="inline-flex min-w-0 items-baseline gap-1">
+                  <span className="text-[9px] font-medium uppercase text-muted-foreground sm:text-[10px]">累计</span>
+                  <AnimatedStatValue
+                    as="span"
+                    value={totalTrafficTotals.connections.toLocaleString()}
+                    loading={totalTrafficTotalsLoading}
+                    cacheKey={`rules.traffic.${trafficTotalsCacheScope}.total.connections`}
+                    fallbackCacheKeys={[`rules.traffic.${trafficTotalsLastCacheScope}.total.last.connections`, "rules.traffic.total.last.connections"]}
+                    mirrorCacheKeys={[`rules.traffic.${trafficTotalsLastCacheScope}.total.last.connections`, "rules.traffic.total.last.connections"]}
+                    fallbackValue="0"
+                    className="truncate text-xs font-semibold tabular-nums sm:text-xl"
+                  />
+                </div>
+                <div className="inline-flex min-w-0 items-baseline gap-1">
+                  <span className="text-[9px] font-medium uppercase text-muted-foreground sm:text-[10px]">24H</span>
+                  <AnimatedStatValue
+                    as="span"
+                    value={dailyTrafficTotals.connections.toLocaleString()}
+                    loading={dailyTrafficTotalsLoading}
+                    cacheKey={`rules.traffic.${trafficTotalsCacheScope}.daily.connections`}
+                    fallbackCacheKeys={[`rules.traffic.${trafficTotalsLastCacheScope}.daily.last.connections`, "rules.traffic.daily.last.connections"]}
+                    mirrorCacheKeys={[`rules.traffic.${trafficTotalsLastCacheScope}.daily.last.connections`, "rules.traffic.daily.last.connections"]}
+                    fallbackValue="0"
+                    className="truncate text-[10px] font-semibold tabular-nums text-foreground sm:text-xs"
+                  />
+                </div>
+              </div>
             </div>
-            <Activity className="hidden h-4 w-4 shrink-0 text-chart-3 sm:block sm:h-6 sm:w-6" />
+            <Activity className="h-5 w-5 shrink-0 text-chart-3 sm:h-6 sm:w-6" />
           </CardContent>
         </Card>
       </div>
@@ -5588,7 +5644,11 @@ function RulesContent() {
                       onValueChange={(v) => {
                         const nextTunnelId = v === "none" ? null : Number(v);
                         const tunnel = nextTunnelId ? tunnels?.find((t: any) => t.id === nextTunnelId) : null;
-                        setForm({ ...form, tunnelId: nextTunnelId, hostId: tunnel ? tunnel.entryHostId : null });
+                        setForm({
+                          ...form,
+                          tunnelId: nextTunnelId,
+                          hostId: tunnel ? tunnel.entryHostId : null,
+                        });
                       }}
                     >
                       <SelectTrigger><SelectValue /></SelectTrigger>
@@ -5820,17 +5880,34 @@ function RulesContent() {
                   onChange={(e) => setForm({ ...form, targetIp: e.target.value })}
                 />
               </div>
-              <div className="space-y-2">
-                <Label>{form.routeMode === "local" ? "目标端口" : "最终目标端口"} <span className="text-destructive">*</span></Label>
-                <Input
-                  type="number"
-                  min={1}
-                  max={65535}
-                  step={1}
-                  placeholder="例如: 80"
-                  value={form.targetPort || ""}
-                  onChange={(e) => setForm({ ...form, targetPort: parseInt(e.target.value) || 0 })}
-                />
+              <div className="space-y-2 sm:col-span-2">
+                <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(220px,0.9fr)] sm:items-end">
+                  <div className="space-y-2">
+                    <Label>{form.routeMode === "local" ? "目标端口" : "最终目标端口"} <span className="text-destructive">*</span></Label>
+                    <Input
+                      type="number"
+                      min={1}
+                      max={65535}
+                      step={1}
+                      placeholder="例如: 80"
+                      value={form.targetPort || ""}
+                      onChange={(e) => setForm({ ...form, targetPort: parseInt(e.target.value) || 0 })}
+                    />
+                  </div>
+                  <div className="flex min-h-10 flex-col gap-2 rounded-md bg-muted/35 px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
+                    <div className="min-w-0 space-y-0.5">
+                      <Label className="text-sm font-medium">异常TG提醒</Label>
+                      <p className="text-xs text-muted-foreground">
+                        {telegramBotReady ? "规则运行异常时提醒已绑定 Telegram 的管理员。" : "请先在系统设置中配置并启用 TG 机器人。"}
+                      </p>
+                    </div>
+                    <Switch
+                      checked={telegramBotReady && form.telegramErrorNotifyEnabled}
+                      disabled={!telegramBotReady}
+                      onCheckedChange={(checked) => setForm({ ...form, telegramErrorNotifyEnabled: checked })}
+                    />
+                  </div>
+                </div>
               </div>
             </div>
             {kernelForwardWarning && (

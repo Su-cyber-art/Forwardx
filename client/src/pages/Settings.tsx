@@ -239,7 +239,7 @@ const manualPanelUpgradeCommands = [
 ];
 
 const directForwardProtocolKeys = [...FORWARD_TYPES] as const;
-const tunnelForwardProtocolKeys = [...TUNNEL_PROTOCOLS] as const;
+const tunnelForwardProtocolKeys = TUNNEL_PROTOCOLS.filter((key) => key !== "nginx_tls");
 const LOG_PAGE_SIZE = 200;
 const settingsTabTriggerClass = "min-w-0 justify-center gap-1.5 px-2 text-xs sm:w-[7.5rem] sm:px-3 sm:text-sm [&>svg]:shrink-0";
 
@@ -1915,7 +1915,7 @@ function TelegramBotSettingsCard() {
                 在系统配置填写公开地址，并在 @BotFather 绑定同一域名。
               </AlertDescription>
             </Alert>
-            <div className="grid gap-3 lg:grid-cols-3">
+            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
               <div className="rounded-lg border border-border/40 bg-background/50 p-3">
                 <div className="flex items-center justify-between gap-3">
                   <div>
@@ -3276,7 +3276,7 @@ function SystemInfoSection() {
   useEffect(() => {
     if (settings) {
       setPanelUrlInput(settings.panelPublicUrl || "");
-      setWebPortInput(String(settings.webPort || 3000));
+      setWebPortInput(String(settings.webPort || 9810));
       setPanelSslEnabled(!!settings.panelSsl?.enabled);
       setPanelSslMode(settings.panelSsl?.mode === "pem" ? "pem" : "path");
       setPanelSslCertPath(settings.panelSsl?.certPath || "");
@@ -3439,7 +3439,7 @@ function SystemInfoSection() {
       toast.error("端口必须是 1-65535 的数字");
       return;
     }
-    if (port === Number(settings?.webPort || 3000)) {
+    if (port === Number(settings?.webPort || 9810)) {
       toast.info("端口未变化");
       return;
     }
@@ -3772,7 +3772,7 @@ function SystemInfoSection() {
           <CardContent className="space-y-3">
             <div className="flex flex-col gap-2 sm:flex-row">
               <Input
-                placeholder="例如: https://forwardx.example.com 或 http://1.2.3.4:3000"
+                placeholder="例如: https://forwardx.example.com 或 http://1.2.3.4:9810"
                 value={panelUrlInput}
                 onChange={(e) => setPanelUrlInput(e.target.value)}
                 className="flex-1"
@@ -3823,7 +3823,7 @@ function SystemInfoSection() {
               </Button>
             </div>
             <p className="text-xs text-muted-foreground">
-              当前监听端口：{settings?.webPort || 3000}。修改后服务会重启，请使用新端口访问后台。
+              当前监听端口：{settings?.webPort || 9810}。修改后服务会重启，请使用新端口访问后台。
             </p>
             {!settings?.webPortManagement?.enabled && (
               <Alert>
@@ -3852,7 +3852,7 @@ function SystemInfoSection() {
               <div className="min-w-0">
                 <p className="text-sm font-medium">启用 HTTPS</p>
                 <p className="text-xs text-muted-foreground">
-                  当前协议：{settings?.panelSsl?.activeProtocol === "https" ? "HTTPS" : "HTTP"}，端口：{settings?.webPort || 3000}
+                  当前协议：{settings?.panelSsl?.activeProtocol === "https" ? "HTTPS" : "HTTP"}，端口：{settings?.webPort || 9810}
                 </p>
               </div>
               <Switch className="shrink-0" checked={panelSslEnabled} onCheckedChange={setPanelSslEnabled} />
@@ -4024,7 +4024,7 @@ function SystemInfoSection() {
               确认修改面板 SSL
             </DialogTitle>
             <DialogDescription>
-              确认后面板会重启，当前端口 {settings?.webPort || 3000} 将切换为 {panelSslEnabled ? "HTTPS" : "HTTP"} 访问。
+              确认后面板会重启，当前端口 {settings?.webPort || 9810} 将切换为 {panelSslEnabled ? "HTTPS" : "HTTP"} 访问。
             </DialogDescription>
           </DialogHeader>
           <Alert>
