@@ -6,6 +6,7 @@ import { forwardTypeSchema } from "./schemas";
 import { pushTunnelEndpointRefresh, refreshUserForwardEndpoints, requireHostUseAccess, requireTunnelUseOrTrafficBillingAccess } from "./helpers";
 import { requireRuleProtocolEnabled } from "../forwardProtocolSettings";
 import { combinePortPolicies, isPortAllowedByPolicy, portPolicyErrorMessage, portPolicyFrom } from "../portPolicy";
+import { isTelegramBotReady } from "../telegramReady";
 
 const targetHostSchema = z.string().min(1).max(253).refine(
   (v) => /^[a-zA-Z0-9]([a-zA-Z0-9\-_.]*[a-zA-Z0-9])?$|^[a-fA-F0-9:.]+$/.test(v.trim()),
@@ -48,6 +49,13 @@ const transportTuningInputShape = {
   udpOverTcp: z.boolean().optional(),
   udpOverTcpPort: z.number().int().min(0).max(65535).nullable().optional(),
 } as const;
+
+async function requireRuleTelegramNotifyReady(enabled?: boolean) {
+  if (!enabled) return;
+  if (!(await isTelegramBotReady())) {
+    throw new Error("请先在系统设置中配置并启用 Telegram 机器人，再开启异常TG提醒");
+  }
+}
 
 type FailoverInput = {
   failoverEnabled?: boolean;
@@ -349,6 +357,7 @@ export const crudRulesRouter = router({
         "请输入有效的 IP 地址或域名"
       ),
       targetPort: z.number().min(1).max(65535),
+      telegramErrorNotifyEnabled: z.boolean().optional().default(false),
       blockHttp: z.boolean().optional(),
       blockSocks: z.boolean().optional(),
       blockTls: z.boolean().optional(),
@@ -357,6 +366,7 @@ export const crudRulesRouter = router({
       ...transportTuningInputShape,
     }))
     .mutation(async ({ input, ctx }) => {
+      await requireRuleTelegramNotifyReady(input.telegramErrorNotifyEnabled);
       // 权限检查：管理员或有 canAddRules 权限的用户
       let currentUser = await db.getUserById(ctx.user.id);
       // 转发方式权限检查：非管理员需在 allowedForwardTypes 列表中
@@ -439,6 +449,7 @@ export const crudRulesRouter = router({
           sourcePort,
           targetIp: normalizeRuleTargetIp(input.targetIp, { tunnelId: forwardType === "gost" && !isForwardChain && (group as any).groupType === "tunnel" ? 1 : null }),
           targetPort: input.targetPort,
+          telegramErrorNotifyEnabled: !!input.telegramErrorNotifyEnabled,
           blockHttp: false,
           blockSocks: false,
           blockTls: false,
@@ -585,6 +596,7 @@ export const crudRulesRouter = router({
         ...normalizeFailoverInput(input, input.protocol),
         ...normalizeProxyProtocolInput(input, input.protocol, input.forwardType, false, { tunnelRoute: !!tunnelId }),
         ...transportTuning,
+        telegramErrorNotifyEnabled: !!input.telegramErrorNotifyEnabled,
         blockHttp: false,
         blockSocks: false,
         blockTls: false,
@@ -627,6 +639,7 @@ export const crudRulesRouter = router({
         "请输入有效的 IP 地址或域名"
       ).optional(),
       targetPort: z.number().min(1).max(65535).optional(),
+      telegramErrorNotifyEnabled: z.boolean().optional(),
       blockHttp: z.boolean().optional(),
       blockSocks: z.boolean().optional(),
       blockTls: z.boolean().optional(),
@@ -640,6 +653,7 @@ export const crudRulesRouter = router({
       if (!rule) throw new Error("规则不存在");
       if (ctx.user.role !== "admin" && rule.userId !== ctx.user.id) throw new Error("无权操作此规则");
       if ((rule as any).forwardGroupRuleId) throw new Error("转发组成员规则由系统维护，不能直接修改");
+      await requireRuleTelegramNotifyReady(input.telegramErrorNotifyEnabled);
 
       if ((rule as any).isForwardGroupTemplate) {
         const groupId = Number((rule as any).forwardGroupId || 0);

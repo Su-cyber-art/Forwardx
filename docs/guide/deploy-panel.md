@@ -13,7 +13,7 @@ curl -fsSL https://raw.githubusercontent.com/Su-cyber-art/Forwardx/main/scripts/
 安装完成后访问：
 
 ```text
-http://服务器IP:3000
+http://服务器IP:9810
 ```
 
 第一次打开面板时不会直接进入后台，而是进入初始化向导。你需要先选择数据库，再创建管理员账号。
@@ -65,57 +65,66 @@ pnpm -v
 
 ### 2. 下载面板安装包
 
-把 `VERSION` 改成 GitHub Releases 中的最新版本号：
+把 `VERSION` 改成当前 fork GitHub Releases 中的最新版本号：
 
 ```bash
-VERSION=v2.3.188
-mkdir -p /opt/forwardx-panel
-cd /opt/forwardx-panel
+VERSION=v2.3.198
+APP_DIR=/opt/forwardx-panel
+
+mkdir -p "$APP_DIR"
 curl -fL "https://github.com/Su-cyber-art/Forwardx/releases/download/${VERSION}/forwardx-panel-${VERSION}.tar.gz" -o /tmp/forwardx-panel.tar.gz
-tar -xzf /tmp/forwardx-panel.tar.gz -C /opt/forwardx-panel
-```
-
-如果安装包内包含依赖补丁目录，保持 `patches` 目录和 `package.json` 在同一安装目录下。
-
-### 3. 安装运行依赖
-
-```bash
-cd /opt/forwardx-panel
+tar -xzf /tmp/forwardx-panel.tar.gz -C "$APP_DIR"
+cd "$APP_DIR"
 pnpm install --prod --frozen-lockfile
 ```
 
-### 4. 写入环境变量
+如果下载时提示安装包不存在，通常是 GitHub Actions 还没有把该版本安装包上传完成，稍后重试即可。如果安装包内包含依赖补丁目录，保持 `patches` 目录和 `package.json` 在同一安装目录下。
+
+### 3. 写入运行环境
+
+先生成随机登录密钥：
 
 ```bash
+openssl rand -hex 32
+```
+
+创建数据目录和 `.env`：
+
+```bash
+mkdir -p /opt/forwardx-panel/data
 cat > /opt/forwardx-panel/.env <<'EOF'
 NODE_ENV=production
-PORT=3000
-JWT_SECRET=请替换为随机字符串
+PORT=9810
 DATABASE_CONFIG_PATH=/opt/forwardx-panel/data/database.json
 SQLITE_PATH=/opt/forwardx-panel/data/forwardx.db
+MYSQL_CONFIG_PATH=/opt/forwardx-panel/data/mysql.json
+JWT_SECRET=请替换为随机字符串
 FORWARDX_PORT_CONFIG_PATH=/opt/forwardx-panel/.env
 FORWARDX_PORT_MANAGEMENT=local
 FORWARDX_UPGRADE_COMMAND=/bin/bash /opt/forwardx-panel/scripts/install-panel-local.sh upgrade
 EOF
+chmod 600 /opt/forwardx-panel/.env
 ```
 
-更多环境变量见 [环境变量](./env-vars.md)。
+不确定数据库怎么选时，不需要提前写数据库变量。首次进入面板时选择 SQLite 即可。更多环境变量见 [环境变量](./env-vars.md)。
 
-### 5. 写入 systemd 服务
+### 4. 创建 systemd 服务
 
 ```bash
 cat > /etc/systemd/system/forwardx-panel.service <<'EOF'
 [Unit]
 Description=ForwardX Panel
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=/opt/forwardx-panel
 EnvironmentFile=/opt/forwardx-panel/.env
-ExecStart=/usr/bin/node /opt/forwardx-panel/dist/index.js
+ExecStart=/usr/bin/node dist/index.js
 Restart=always
-RestartSec=3
+RestartSec=5
+User=root
 
 [Install]
 WantedBy=multi-user.target
@@ -123,8 +132,37 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now forwardx-panel
-systemctl status forwardx-panel --no-pager
+journalctl -u forwardx-panel -n 100 --no-pager
 ```
+
+浏览器访问：
+
+```text
+http://服务器IP:9810
+```
+
+### 5. 手动升级本地面板
+
+升级前建议先备份 `/opt/forwardx-panel/data`。升级时保留 `data` 和 `.env`，只替换程序文件。
+
+```bash
+VERSION=v2.3.198
+APP_DIR=/opt/forwardx-panel
+
+systemctl stop forwardx-panel
+cd "$APP_DIR"
+rm -rf dist client drizzle scripts
+rm -f package.json pnpm-lock.yaml pnpm-workspace.yaml
+curl -fL "https://github.com/Su-cyber-art/Forwardx/releases/download/${VERSION}/forwardx-panel-${VERSION}.tar.gz" -o /tmp/forwardx-panel.tar.gz
+tar -xzf /tmp/forwardx-panel.tar.gz -C "$APP_DIR"
+pnpm install --prod --frozen-lockfile
+systemctl start forwardx-panel
+journalctl -u forwardx-panel -n 100 --no-pager
+```
+
+::: warning 不要删除这些文件
+本地部署升级时不要删除 `/opt/forwardx-panel/data` 和 `/opt/forwardx-panel/.env`。前者保存数据库和数据库连接配置，后者保存端口、登录密钥等运行环境。
+:::
 
 ## 配置域名和 HTTPS
 
@@ -138,7 +176,7 @@ server {
     server_name panel.example.com;
 
     location / {
-        proxy_pass http://127.0.0.1:3000;
+        proxy_pass http://127.0.0.1:9810;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
