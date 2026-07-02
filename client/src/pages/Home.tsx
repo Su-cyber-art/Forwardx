@@ -7,6 +7,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
 import { mobileAuth } from "@/lib/mobileAuth";
+import { pollingInterval } from "@/lib/polling";
 import { trpc } from "@/lib/trpc";
 import {
   Activity,
@@ -394,22 +395,22 @@ function TrafficPieCard({
 function DashboardContent() {
   const { user } = useAuth();
   const isAdmin = user?.role === "admin";
-  const { data: stats, isLoading } = trpc.dashboard.stats.useQuery(undefined, { refetchInterval: 15000 });
+  const { data: stats, isLoading } = trpc.dashboard.stats.useQuery(undefined, { refetchInterval: pollingInterval("normal") });
   const { data: trafficTotals, isLoading: trafficTotalsLoading } = trpc.dashboard.trafficTotals.useQuery(undefined, {
-    refetchInterval: 15000,
+    refetchInterval: pollingInterval("normal"),
     staleTime: 5000,
   });
   const { data: wallet, isLoading: walletLoading } = trpc.billing.me.useQuery(undefined, { enabled: !isAdmin });
   const { data: trafficBilling, isLoading: trafficBillingLoading } = trpc.trafficBilling.status.useQuery();
   const { data: subscriptions = [], isLoading: subscriptionsLoading } = trpc.plans.mySubscriptions.useQuery(undefined, { enabled: !isAdmin });
-  const { data: userTraffic = [], isLoading: userTrafficLoading } = trpc.dashboard.userTraffic.useQuery(undefined, { refetchInterval: 30000 });
+  const { data: userTraffic = [], isLoading: userTrafficLoading } = trpc.dashboard.userTraffic.useQuery(undefined, { refetchInterval: pollingInterval("slow") });
   const { data: trafficBreakdown, isLoading: breakdownLoading } = trpc.dashboard.trafficBreakdown.useQuery(
     { hours: 24, limit: 30 },
-    { refetchInterval: 30000, staleTime: 25000 },
+    { refetchInterval: pollingInterval("slow"), staleTime: 25000 },
   );
   const { data: trafficSeries, isLoading: trendLoading } = trpc.dashboard.trafficSeries.useQuery(
     { hours: 24, bucketMinutes: 60 },
-    { refetchInterval: 30000, staleTime: 25000 },
+    { refetchInterval: pollingInterval("slow"), staleTime: 25000 },
   );
 
   const chartData = useMemo(
@@ -553,7 +554,7 @@ function DashboardContent() {
         <StatCard
           title="入站流量"
           value={formatBytes(trafficTotals?.totalTrafficIn ?? 0)}
-          subtitle="累计入站"
+          subtitle="近 3 天入站"
           icon={ArrowDownToLine}
           tone="bg-gradient-to-br from-violet-500 to-violet-600"
           loading={trafficTotalsLoading}
@@ -565,7 +566,7 @@ function DashboardContent() {
         <StatCard
           title="出站流量"
           value={formatBytes(trafficTotals?.totalTrafficOut ?? 0)}
-          subtitle="累计出站"
+          subtitle="近 3 天出站"
           icon={ArrowUpFromLine}
           tone="bg-gradient-to-br from-amber-500 to-amber-600"
           loading={trafficTotalsLoading}

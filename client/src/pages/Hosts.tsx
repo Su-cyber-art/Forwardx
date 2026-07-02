@@ -14,17 +14,20 @@ import {
   agentDetectedIpText,
   compareVersions,
   formatBytes,
+  formatUptime,
   hostAddressText,
-  hostPrimaryAddressLines,
+  hostPrimaryAddressText,
   HostRegionBadge,
   hostRegionText,
   isAgentUpgradeTimedOut,
   isAgentVersionBehind,
+  metricUsageProgressClass,
 } from "@/components/hosts/hostDisplay";
 import { PersistentPagination, usePersistentPagination } from "@/components/PersistentPagination";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { useConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
   Dialog,
   DialogContent,
@@ -35,6 +38,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Progress } from "@/components/ui/progress";
 import {
   Select,
   SelectContent,
@@ -55,14 +59,21 @@ import { Switch } from "@/components/ui/switch";
 import DataSectionLoading from "@/components/DataSectionLoading";
 import { countryFeatureHasCode, normalizeCountryCode } from "@/lib/countryFeatures";
 import { useUrlTab } from "@/hooks/useUrlTab";
+import { pollingInterval, visiblePollingInterval } from "@/lib/polling";
 import { trpc } from "@/lib/trpc";
 import {
   Activity,
+  ArrowDownToLine,
   ArrowUpFromLine,
+  ArrowRightLeft,
+  CalendarDays,
+  Clock,
+  Cpu,
   Plus,
   Trash2,
   Pencil,
   Server,
+  HardDrive,
   LayoutGrid,
   List,
   Globe,
@@ -72,11 +83,13 @@ import {
   Gauge,
   AlertTriangle,
   Loader2,
+  MemoryStick,
   RefreshCw,
   Key,
   Rows3,
   RotateCcw,
   ActivitySquare,
+  Wifi,
 } from "lucide-react";
 import type { GlobeMethods } from "react-globe.gl";
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
@@ -704,39 +717,272 @@ function formatBytesPerSecond(value: unknown) {
   return `${formatBytes(bytes)}/s`;
 }
 
+function formatOptionalBytesPerSecond(value: unknown) {
+  if (value === null || value === undefined) return "--";
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return "--";
+  return formatBytesPerSecond(bytes);
+}
+
+function clampPercent(value: unknown) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return null;
+  return Math.max(0, Math.min(100, Math.round(num)));
+}
+
+function formatUsagePercent(value: unknown) {
+  const percent = clampPercent(value);
+  return percent === null ? "--" : `${percent}%`;
+}
+
+function formatMetricSizeDetail(used: unknown, total: unknown) {
+  const usedBytes = Number(used);
+  const totalBytes = Number(total);
+  if (!Number.isFinite(usedBytes) || usedBytes <= 0) return "";
+  if (!Number.isFinite(totalBytes) || totalBytes <= 0) return formatBytes(usedBytes);
+  return `${formatBytes(usedBytes)} / ${formatBytes(totalBytes)}`;
+}
+
+const hostListDayMs = 24 * 60 * 60 * 1000;
+
+function parseHostDateTime(value: unknown) {
+  if (!value) return null;
+  const ms = value instanceof Date
+    ? value.getTime()
+    : typeof value === "number"
+      ? value
+      : Date.parse(String(value));
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function formatHostRemainingDays(purchasedAt: unknown, stoppedAt: unknown) {
+  const purchasedMs = parseHostDateTime(purchasedAt);
+  const stoppedMs = parseHostDateTime(stoppedAt);
+  if (purchasedMs === null || stoppedMs === null || stoppedMs <= purchasedMs) return "--";
+  const remainingMs = stoppedMs - Date.now();
+  if (remainingMs <= 0) return "已到期";
+  if (remainingMs < hostListDayMs) return "不足1天";
+  return `${Math.ceil(remainingMs / hostListDayMs)}天`;
+}
+
+function hostRemainingClass(value: string) {
+  if (value === "已到期") return "text-destructive";
+  if (value === "不足1天") return "text-amber-500";
+  if (value === "--") return "text-muted-foreground";
+  return "text-emerald-500";
+}
+
+function compactHostOsInfo(value: unknown) {
+  return String(value || "")
+    .replace(/\s*\([^)]*\)\s*/g, " ")
+    .replace(/\s+/g, " ")
+    .trim() || "-";
+}
+
+function HostListResourceMetric({
+  icon: Icon,
+  label,
+  value,
+  detail,
+  isOnline,
+}: {
+  icon: typeof ActivitySquare;
+  label: string;
+  value: unknown;
+  detail?: string;
+  isOnline: boolean;
+}) {
+  const percent = clampPercent(value);
+  const progressValue = percent ?? 0;
+  const progressClass = percent === null
+    ? "h-1.5 bg-muted [&>div]:bg-muted-foreground/20"
+    : metricUsageProgressClass(progressValue, isOnline);
+  return (
+    <div className="min-w-[112px] space-y-1.5">
+      <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+        <Icon className="h-3.5 w-3.5 shrink-0" />
+        <span className="font-medium">{label}</span>
+        <span className="ml-auto font-semibold tabular-nums text-foreground">{formatUsagePercent(value)}</span>
+      </div>
+      <Progress value={progressValue} className={progressClass} />
+      {detail && (
+        <div className="truncate text-[10px] leading-none text-muted-foreground/70" title={detail}>
+          {detail}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function HostListFlowPair({
+  inValue,
+  outValue,
+  inTitle,
+  outTitle,
+}: {
+  inValue: string;
+  outValue: string;
+  inTitle?: string;
+  outTitle?: string;
+}) {
+  return (
+    <div className="min-w-[118px] space-y-1 text-xs tabular-nums">
+      <div className="flex items-center gap-1.5 text-emerald-500" title={inTitle || inValue}>
+        <ArrowDownToLine className="h-3.5 w-3.5 shrink-0" />
+        <span className="min-w-0 truncate font-medium">{inValue}</span>
+      </div>
+      <div className="flex items-center gap-1.5 text-sky-500" title={outTitle || outValue}>
+        <ArrowUpFromLine className="h-3.5 w-3.5 shrink-0" />
+        <span className="min-w-0 truncate font-medium">{outValue}</span>
+      </div>
+    </div>
+  );
+}
+
+function HostListStatusBadge({ host }: { host: any }) {
+  const online = !!host?.isOnline;
+  return (
+    <div className="inline-flex min-w-[68px] items-center justify-center gap-2 whitespace-nowrap rounded-full border border-border/50 bg-background/50 px-2.5 py-1 text-xs font-medium">
+      <span className={`h-2 w-2 rounded-full ${online ? "bg-emerald-500 shadow-sm shadow-emerald-500/50" : "bg-destructive shadow-sm shadow-destructive/50"}`} />
+      <span className={online ? "text-emerald-500" : "text-destructive"}>{online ? "在线" : "离线"}</span>
+    </div>
+  );
+}
+
 function HostSummaryCard({
   title,
   value,
   subtitle,
   icon: Icon,
+  tone,
   loading,
   cacheKey,
+  className,
 }: {
   title: string;
   value: string;
-  subtitle: string;
+  subtitle?: string;
   icon: typeof ActivitySquare;
+  tone: string;
   loading?: boolean;
   cacheKey: string;
+  className?: string;
 }) {
   return (
-    <Card className="border-border/40 bg-card/60 backdrop-blur-md">
-      <CardContent className="flex min-h-[104px] items-center justify-between gap-3 p-4">
-        <div className="min-w-0">
-          <p className="text-xs text-muted-foreground">{title}</p>
+    <Card className={`group relative h-full overflow-hidden border-border/40 bg-card/60 backdrop-blur-md transition-all duration-300 hover:-translate-y-0.5 hover:border-border/70 hover:shadow-lg hover:shadow-primary/5 ${className || ""}`.trim()}>
+      <div className={`absolute inset-0 opacity-[0.035] transition-opacity group-hover:opacity-[0.07] ${tone}`} />
+      <CardContent className="relative min-h-[112px] p-3.5 sm:min-h-[112px] sm:p-4">
+        <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">{title}</p>
+        <div className={`absolute right-4 top-4 hidden h-10 w-10 shrink-0 items-center justify-center rounded-xl shadow-sm sm:flex ${tone}`}>
+          <Icon className="h-5 w-5 text-white" />
+        </div>
+        <div className="absolute inset-x-4 top-1/2 -translate-x-3 -translate-y-1/2 px-8 text-center sm:-translate-x-4 sm:px-14">
           <AnimatedStatValue
             as="p"
             value={value}
             loading={loading}
             cacheKey={cacheKey}
             fallbackValue="0"
-            className="mt-1 truncate text-xl font-semibold tabular-nums"
+            className="break-words text-2xl font-bold leading-none tracking-tight tabular-nums sm:text-[28px]"
             title={value}
           />
-          <p className="mt-1 truncate text-[11px] text-muted-foreground" title={subtitle}>{subtitle}</p>
         </div>
-        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-border/50 bg-background/45 text-primary">
-          <Icon className="h-5 w-5" />
+        {subtitle && (
+          <p className="absolute bottom-3 right-4 max-w-[55%] truncate text-right text-xs leading-5 text-muted-foreground/80" title={subtitle}>
+            {subtitle}
+          </p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function HostTrafficDirectionStat({
+  label,
+  value,
+  icon: Icon,
+  tone,
+  loading,
+  cacheKey,
+  className,
+}: {
+  label: string;
+  value: string;
+  icon: typeof ActivitySquare;
+  tone: string;
+  loading?: boolean;
+  cacheKey: string;
+  className?: string;
+}) {
+  return (
+    <div className={`min-w-0 ${className || ""}`.trim()}>
+      <div className="flex items-center gap-2.5">
+        <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg shadow-sm ${tone}`}>
+          <Icon className="h-4 w-4 text-white" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">{label}</p>
+          <AnimatedStatValue
+            as="p"
+            value={value}
+            loading={loading}
+            cacheKey={cacheKey}
+            fallbackValue="0 B/s"
+            className="mt-0.5 whitespace-nowrap text-base font-semibold leading-tight tabular-nums sm:text-lg"
+            title={value}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function HostTrafficSummaryCard({
+  title,
+  inValue,
+  outValue,
+  icon: Icon,
+  loading,
+  cacheKey,
+  className,
+}: {
+  title: string;
+  inValue: string;
+  outValue: string;
+  icon: typeof ActivitySquare;
+  loading?: boolean;
+  cacheKey: string;
+  className?: string;
+}) {
+  return (
+    <Card className={`group relative h-full overflow-hidden border-border/40 bg-card/60 backdrop-blur-md transition-all duration-300 hover:-translate-y-0.5 hover:border-border/70 hover:shadow-lg hover:shadow-primary/5 ${className || ""}`.trim()}>
+      <div className="absolute inset-0 bg-gradient-to-br from-primary/10 to-transparent opacity-[0.035] transition-opacity group-hover:opacity-[0.07]" />
+      <CardContent className="relative flex h-full flex-col justify-start p-3.5 sm:p-4">
+        <div className="flex min-h-0 items-start justify-between gap-3">
+          <div className="min-w-0 space-y-1 pr-12">
+            <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">{title}</p>
+          </div>
+          <div className="pointer-events-none absolute right-4 top-3.5 hidden h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary shadow-sm sm:flex">
+            <Icon className="h-5 w-5" />
+          </div>
+        </div>
+        <div className="mt-2 grid grid-cols-[repeat(auto-fit,minmax(145px,1fr))] gap-2.5">
+          <HostTrafficDirectionStat
+            label="入向"
+            value={inValue}
+            loading={loading}
+            cacheKey={`${cacheKey}.in`}
+            icon={ArrowDownToLine}
+            tone="bg-emerald-500"
+          />
+          <HostTrafficDirectionStat
+            label="出向"
+            value={outValue}
+            loading={loading}
+            cacheKey={`${cacheKey}.out`}
+            icon={ArrowUpFromLine}
+            tone="bg-amber-500"
+          />
         </div>
       </CardContent>
     </Card>
@@ -820,8 +1066,9 @@ function storeHostProbeServiceViewMode(viewMode: HostProbeServiceViewMode) {
 function HostsContent() {
   const { user } = useAuth();
   const utils = trpc.useUtils();
+  const confirmDialog = useConfirmDialog();
   const pageVisible = usePageVisible();
-  const hostRefreshInterval = pageVisible ? 2000 : false;
+  const hostRefreshInterval = visiblePollingInterval("live", pageVisible);
   const { data: hosts, isLoading, isError, error, refetch } = trpc.hosts.list.useQuery(undefined, {
     refetchInterval: hostRefreshInterval,
     refetchOnWindowFocus: true,
@@ -870,10 +1117,10 @@ function HostsContent() {
     defaultValue: "hosts",
     storageKey: HOST_MANAGE_TAB_STORAGE_KEY,
   });
-  const hostLiveRefreshInterval = pageVisible && activeManageTab === "hosts" ? 2000 : false;
+  const hostLiveRefreshInterval = visiblePollingInterval("live", pageVisible && activeManageTab === "hosts");
   const { data: hostSummary, isLoading: isHostSummaryLoading } = trpc.hosts.summary.useQuery(undefined, {
     enabled: activeManageTab === "hosts",
-    refetchInterval: hostLiveRefreshInterval || 30000,
+    refetchInterval: hostLiveRefreshInterval || pollingInterval("slow"),
   });
   const [tokenCreateSignal, setTokenCreateSignal] = useState(0);
   const [serviceCreateSignal, setServiceCreateSignal] = useState(0);
@@ -1134,7 +1381,7 @@ function HostsContent() {
           ddnsEnabled: form.ddnsEnabled,
           ddnsDomain: form.ddnsDomain.trim(),
           ddnsIpVersion: form.ddnsIpVersion,
-          ddnsRecordType: form.ddnsIpVersion === "ipv6" ? "AAAA" : "A",
+          ddnsRecordType: (form.ddnsIpVersion === "ipv6" ? "AAAA" : "A") as "A" | "AAAA",
         }
       : {};
     const protocolPolicyPayload = user?.role === "admin"
@@ -1199,7 +1446,7 @@ function HostsContent() {
     () => pagedHosts.map((host: any) => Number(host.id)).filter((id) => Number.isInteger(id) && id > 0),
     [pagedHosts]
   );
-  const { data: probeServices = [] } = trpc.hosts.probeServices.useQuery(undefined, { refetchInterval: 30000 });
+  const { data: probeServices = [] } = trpc.hosts.probeServices.useQuery(undefined, { refetchInterval: pollingInterval("slow") });
   const { data: hostTrafficRows = [] } = trpc.hosts.trafficSummary.useQuery(
     { hostIds: pagedHostIds },
     { enabled: !!hostLiveRefreshInterval && pagedHostIds.length > 0, refetchInterval: hostLiveRefreshInterval }
@@ -1209,6 +1456,15 @@ function HostsContent() {
     for (const row of hostTrafficRows as any[]) map.set(Number(row.hostId), row);
     return map;
   }, [hostTrafficRows]);
+  const { data: hostLatestMetricRows = [] } = trpc.hosts.latestMetricsSummary.useQuery(
+    { hostIds: pagedHostIds },
+    { enabled: !!hostLiveRefreshInterval && viewMode === "table" && pagedHostIds.length > 0, refetchInterval: hostLiveRefreshInterval }
+  );
+  const hostLatestMetricById = useMemo(() => {
+    const map = new Map<number, any>();
+    for (const row of hostLatestMetricRows as any[]) map.set(Number(row.hostId), row);
+    return map;
+  }, [hostLatestMetricRows]);
   const requestResetHostTraffic = (host: any) => {
     const hostId = Number(host?.id);
     if (!Number.isInteger(hostId) || hostId <= 0) return;
@@ -1462,32 +1718,38 @@ function HostsContent() {
         </TabsList>
 
         <TabsContent value="hosts" className="space-y-4">
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-            <HostSummaryCard
-              title="当前瞬时流量"
-              value={formatBytesPerSecond(hostSummary?.currentTrafficTotal)}
-              subtitle={`入 ${formatBytesPerSecond(hostSummary?.currentTrafficIn)} / 出 ${formatBytesPerSecond(hostSummary?.currentTrafficOut)}`}
-              icon={ActivitySquare}
-              loading={isHostSummaryLoading && !hostSummary}
-              cacheKey="hosts.summary.currentTraffic"
-            />
-            <HostSummaryCard
-              title="在线状态"
-              value={`${hostSummary?.onlineHosts ?? onlineCount} / ${hostSummary?.totalHosts ?? displayHosts.length}`}
-              subtitle={`${hostSummary?.measuredHosts ?? 0} 台主机有实时流量样本`}
-              icon={Server}
-              loading={isHostSummaryLoading && !hostSummary}
-              cacheKey="hosts.summary.online"
-            />
-            <HostSummaryCard
-              title="累计流量"
-              value={formatBytes(hostSummary?.totalTraffic)}
-              subtitle={`入 ${formatBytes(hostSummary?.totalTrafficIn)} / 出 ${formatBytes(hostSummary?.totalTrafficOut)}`}
-              icon={ArrowUpFromLine}
-              loading={isHostSummaryLoading && !hostSummary}
-              cacheKey="hosts.summary.totalTraffic"
-            />
-          </div>
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+          <HostSummaryCard
+            title="在线状态"
+            value={`${hostSummary?.onlineHosts ?? onlineCount} / ${hostSummary?.totalHosts ?? displayHosts.length}`}
+            subtitle={hostSummary
+              ? (() => {
+                const offlineCount = Math.max(0, (hostSummary?.totalHosts ?? displayHosts.length) - (hostSummary?.onlineHosts ?? onlineCount));
+                return offlineCount > 0 ? `离线 ${offlineCount} 台` : "全部在线";
+              })()
+              : "状态正常"}
+            icon={Server}
+            tone="bg-gradient-to-br from-emerald-500 to-emerald-600"
+            loading={isHostSummaryLoading && !hostSummary}
+            cacheKey="hosts.summary.online"
+          />
+          <HostTrafficSummaryCard
+            title="当前瞬时流量"
+            inValue={formatBytesPerSecond(hostSummary?.currentTrafficIn)}
+            outValue={formatBytesPerSecond(hostSummary?.currentTrafficOut)}
+            icon={ActivitySquare}
+            loading={isHostSummaryLoading && !hostSummary}
+            cacheKey="hosts.summary.currentTraffic"
+          />
+          <HostTrafficSummaryCard
+            title="累计流量"
+            inValue={formatBytes(hostSummary?.totalTrafficIn)}
+            outValue={formatBytes(hostSummary?.totalTrafficOut)}
+            icon={ArrowRightLeft}
+            loading={isHostSummaryLoading && !hostSummary}
+            cacheKey="hosts.summary.totalTraffic"
+          />
+        </div>
       {/* Content */}
       {isInitialLoadingWithoutCache ? (
         <DataSectionLoading label="正在加载主机数据" minHeight="min-h-[260px]" />
@@ -1603,7 +1865,7 @@ function HostsContent() {
         ) : (
           /* ========== 表格式布局 ========== */
           <>
-            <AutoAnimateContainer className="grid grid-cols-1 gap-4 sm:hidden">
+            <AutoAnimateContainer className="grid grid-cols-1 gap-3 sm:hidden">
               {pagedHosts.map((host) => (
                 <HostCard
                   key={host.id}
@@ -1624,84 +1886,122 @@ function HostsContent() {
             <Card className="hidden border-border/40 bg-card/60 backdrop-blur-md sm:block">
               <CardContent className="p-0">
                 <div className="overflow-x-auto">
-                <Table>
+                <Table className="min-w-[1080px]">
                   <TableHeader>
                     <TableRow className="hover:bg-transparent">
-                      <TableHead className="w-[72px] whitespace-nowrap text-center">状态</TableHead>
-                      <TableHead>名称</TableHead>
-                      <TableHead className="min-w-[220px]">地址</TableHead>
-                      <TableHead className="hidden lg:table-cell">端口区间</TableHead>
-                      <TableHead className="hidden md:table-cell">系统</TableHead>
-                      <TableHead className="hidden lg:table-cell">Agent</TableHead>
-                      <TableHead className="hidden sm:table-cell">最后心跳</TableHead>
-                      <TableHead className="text-right">操作</TableHead>
+                      <TableHead className="w-[96px] whitespace-nowrap">状态</TableHead>
+                      <TableHead className="w-[300px] min-w-[300px]">设备名称</TableHead>
+                      <TableHead className="w-[130px] whitespace-nowrap">
+                        <span className="inline-flex items-center gap-1.5"><Cpu className="h-3.5 w-3.5" />CPU</span>
+                      </TableHead>
+                      <TableHead className="w-[140px] whitespace-nowrap">
+                        <span className="inline-flex items-center gap-1.5"><MemoryStick className="h-3.5 w-3.5" />RAM</span>
+                      </TableHead>
+                      <TableHead className="w-[140px] whitespace-nowrap">
+                        <span className="inline-flex items-center gap-1.5"><HardDrive className="h-3.5 w-3.5" />磁盘</span>
+                      </TableHead>
+                      <TableHead className="w-[136px] whitespace-nowrap">累计流量</TableHead>
+                      <TableHead className="w-[136px] whitespace-nowrap">
+                        <span className="inline-flex items-center gap-1.5"><Wifi className="h-3.5 w-3.5" />实时网络</span>
+                      </TableHead>
+                      <TableHead className="w-[116px] whitespace-nowrap">
+                        <span className="inline-flex items-center gap-1.5"><Clock className="h-3.5 w-3.5" />运行时间</span>
+                      </TableHead>
+                      <TableHead className="w-[100px] whitespace-nowrap">
+                        <span className="inline-flex items-center gap-1.5"><CalendarDays className="h-3.5 w-3.5" />到期</span>
+                      </TableHead>
+                      <TableHead className="w-[178px] text-right">操作</TableHead>
                     </TableRow>
                   </TableHeader>
                   <AutoAnimateContainer as={TableBody}>
                     {pagedHosts.map((host) => {
+                      const traffic = hostTrafficById.get(host.id);
+                      const latestMetric = hostLatestMetricById.get(host.id);
                       const agentUpgradeTimedOut = isAgentUpgradeTimedOut(host);
                       const agentUpgrading = !!host.agentUpgradeRequested && !agentUpgradeTimedOut;
+                      const agentNeedsUpdate = isAgentVersionBehind(host.agentVersion, latestAgentVersion);
+                      const remainingDays = formatHostRemainingDays(host.purchasedAt, host.stoppedAt);
+                      const primaryAddressText = hostPrimaryAddressText(host);
+                      const memoryDetail = formatMetricSizeDetail(latestMetric?.memoryUsed, host.memoryTotal);
+                      const diskDetail = formatMetricSizeDetail(latestMetric?.diskUsed, latestMetric?.diskTotal);
                       return (
-                      <TableRow key={host.id}>
-                        <TableCell className="w-[72px] text-center">
-                          <div className="flex items-center justify-center">
-                            {host.isOnline ? (
-                              <span className="h-2.5 w-2.5 rounded-full bg-chart-2 shadow-sm shadow-chart-2/50 animate-pulse" />
-                            ) : (
-                              <span className="h-2.5 w-2.5 rounded-full bg-destructive shadow-sm shadow-destructive/50" />
-                            )}
-                          </div>
+                      <TableRow key={host.id} className="align-middle hover:bg-muted/25">
+                        <TableCell className="w-[96px] whitespace-nowrap">
+                          <HostListStatusBadge host={host} />
                         </TableCell>
-                        <TableCell>
-                          <div className="flex items-center gap-2">
-                            <Server className="h-4 w-4 text-muted-foreground" />
-                            <span className="font-medium">{host.name}</span>
-                          </div>
-                        </TableCell>
-                        <TableCell>
-                          <div className="space-y-1">
-                            {hostPrimaryAddressLines(host).map((item) => (
-                              <div key={item.label} className="flex min-w-0 items-start gap-1 font-mono text-xs leading-5">
-                                <span className="shrink-0 text-[10px] text-muted-foreground">{item.label}</span>
-                                <span className="min-w-0 max-w-[260px] break-all">{item.value}</span>
-                              </div>
-                            ))}
-                            <HostRegionBadge host={host} compact />
-                          </div>
-                        </TableCell>
-                        <TableCell className="hidden lg:table-cell">
-                          <span className="text-xs text-muted-foreground font-mono">
-                            {formatHostPortPolicy(host)}
-                          </span>
-                        </TableCell>
-                        <TableCell className="hidden md:table-cell">
-                          <span className="text-xs text-muted-foreground truncate max-w-[120px] block">
-                            {host.osInfo || "-"}
-                          </span>
-                        </TableCell>
-                        <TableCell className="hidden lg:table-cell">
-                          <div className="flex items-center gap-2">
-                            <span className="text-xs font-mono text-muted-foreground">
-                              {host.agentVersion ? `v${host.agentVersion}` : "-"}
+                        <TableCell className="w-[300px] min-w-[300px]">
+                          <div className="flex min-w-0 items-center gap-3">
+                            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-border/60 bg-background/60 text-muted-foreground shadow-sm">
+                              <Server className="h-4 w-4" />
                             </span>
-                            {isAgentVersionBehind(host.agentVersion, latestAgentVersion) && (
-                              <Badge variant="outline" className="text-[10px] border-amber-500/30 text-amber-500">
-                                发现新版本
-                              </Badge>
-                            )}
-                            {host.agentUpgradeRequested && (
-                              <Badge variant="outline" className={`text-[10px] ${agentUpgradeTimedOut ? "border-destructive/30 text-destructive" : "border-blue-500/30 text-blue-500"}`}>
-                                {agentUpgradeTimedOut ? "升级失败" : "升级中"}
-                              </Badge>
-                            )}
+                            <div className="min-w-0 space-y-0.5">
+                              <div className="flex min-w-0 items-center gap-2">
+                                <span className="min-w-0 truncate font-semibold" title={host.name}>{host.name}</span>
+                                {host.agentVersion && (
+                                  <span className="shrink-0 rounded border border-border/50 bg-muted/35 px-1.5 py-0.5 font-mono text-[10px] leading-none text-muted-foreground">
+                                    v{host.agentVersion}
+                                  </span>
+                                )}
+                                {agentNeedsUpdate && (
+                                  <Badge variant="outline" className="shrink-0 border-amber-500/30 text-[10px] text-amber-500">
+                                    新版本
+                                  </Badge>
+                                )}
+                                {host.agentUpgradeRequested && (
+                                  <Badge variant="outline" className={`shrink-0 text-[10px] ${agentUpgradeTimedOut ? "border-destructive/30 text-destructive" : "border-blue-500/30 text-blue-500"}`}>
+                                    {agentUpgradeTimedOut ? "升级失败" : "升级中"}
+                                  </Badge>
+                                )}
+                              </div>
+                              <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
+                                <HostRegionBadge host={host} compact />
+                                <span className="rounded border border-border/40 bg-muted/25 px-1.5 py-0.5 font-mono" title={`端口策略：${formatHostPortPolicy(host)}`}>
+                                  {formatHostPortPolicy(host)}
+                                </span>
+                              </div>
+                              <div className="flex min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground" title={primaryAddressText}>
+                                <RadioTower className="h-3 w-3 shrink-0" />
+                                <span className="min-w-0 truncate font-mono">{primaryAddressText}</span>
+                              </div>
+                            </div>
                           </div>
                         </TableCell>
-                        <TableCell className="hidden sm:table-cell">
-                          <span className="text-xs text-muted-foreground">
-                            {host.lastHeartbeat
-                              ? new Date(host.lastHeartbeat).toLocaleString()
-                              : "-"}
-                          </span>
+                        <TableCell>
+                          <HostListResourceMetric icon={Cpu} label="CPU" value={latestMetric?.cpuUsage} isOnline={!!host.isOnline} />
+                        </TableCell>
+                        <TableCell>
+                          <HostListResourceMetric icon={MemoryStick} label="RAM" value={latestMetric?.memoryUsage} detail={memoryDetail} isOnline={!!host.isOnline} />
+                        </TableCell>
+                        <TableCell>
+                          <HostListResourceMetric icon={HardDrive} label="Disk" value={latestMetric?.diskUsage} detail={diskDetail} isOnline={!!host.isOnline} />
+                        </TableCell>
+                        <TableCell>
+                          <HostListFlowPair
+                            inValue={formatBytes(Number(traffic?.bytesIn || 0))}
+                            outValue={formatBytes(Number(traffic?.bytesOut || 0))}
+                            inTitle={`累计入向：${formatBytes(Number(traffic?.bytesIn || 0))}`}
+                            outTitle={`累计出向：${formatBytes(Number(traffic?.bytesOut || 0))}`}
+                          />
+                        </TableCell>
+                        <TableCell>
+                          <HostListFlowPair
+                            inValue={formatOptionalBytesPerSecond(latestMetric?.networkSpeedIn)}
+                            outValue={formatOptionalBytesPerSecond(latestMetric?.networkSpeedOut)}
+                            inTitle="实时入向"
+                            outTitle="实时出向"
+                          />
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex items-center gap-1.5 whitespace-nowrap text-xs font-medium tabular-nums text-muted-foreground">
+                            <Clock className="h-3.5 w-3.5 shrink-0" />
+                            <span>{latestMetric?.uptime == null ? "--" : formatUptime(latestMetric.uptime)}</span>
+                          </div>
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex items-center gap-1.5 whitespace-nowrap text-xs font-semibold tabular-nums">
+                            <CalendarDays className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                            <span className={hostRemainingClass(remainingDays)}>{remainingDays}</span>
+                          </div>
                         </TableCell>
                         <TableCell className="text-right">
                           <div className="flex items-center justify-end gap-1">
@@ -1748,8 +2048,13 @@ function HostsContent() {
                               variant="ghost"
                               size="icon"
                               className="h-8 w-8 text-destructive hover:text-destructive"
-                              onClick={() => {
-                                if (confirm("确定要删除此主机吗？"))
+                              onClick={async () => {
+                                if (await confirmDialog({
+                                  title: "删除主机",
+                                  description: "确定要删除此主机吗？删除后相关状态和配置会同步移除。",
+                                  confirmText: "删除",
+                                  tone: "destructive",
+                                }))
                                   deleteMutation.mutate({ id: host.id });
                               }}
                             >
@@ -2122,6 +2427,9 @@ function HostsContent() {
                       <Label className="text-sm font-semibold">协议屏蔽</Label>
                       <span className="text-xs text-muted-foreground">访问策略</span>
                     </div>
+                    <p className="rounded-md border border-border/40 bg-muted/30 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+                      协议屏蔽支持自定义加密隧道，以及 realm / gost / socat / nginx 等用户态转发；iptables / nftables 内核转发暂不支持。
+                    </p>
                     <div className="grid gap-2 sm:grid-cols-3">
                       <label className="flex min-w-0 items-center justify-between gap-3 rounded-md bg-muted/35 px-2.5 py-2">
                         <span className="min-w-0 truncate text-sm font-medium">HTTP</span>

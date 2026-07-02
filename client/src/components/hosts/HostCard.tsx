@@ -1,6 +1,7 @@
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import { useConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Progress } from "@/components/ui/progress";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { trpc } from "@/lib/trpc";
@@ -96,6 +97,7 @@ export default function HostCard({
   refreshInterval,
   compact = false,
 }: HostCardProps) {
+  const confirmDialog = useConfirmDialog();
   const { data: metrics } = trpc.hosts.metrics.useQuery(
     { hostId: host.id, limit: 2, live: !!refreshInterval },
     { refetchInterval: refreshInterval }
@@ -231,6 +233,19 @@ export default function HostCard({
     },
   ];
 
+  const addressRegionBlock = (regionCompact = false) => (
+    <div className={`mt-0.5 min-w-0 space-y-1 ${isOnline ? "" : "opacity-70 grayscale"}`}>
+      <p className="min-w-0 truncate font-mono text-xs leading-5" title={hostPrimaryAddressText(host)}>
+        <span className="mr-1.5 text-muted-foreground">地址</span>
+        {hostPrimaryAddressText(host)}
+      </p>
+      <div className="flex min-w-0 items-center gap-1.5 text-xs leading-5">
+        <span className="shrink-0 text-muted-foreground">国家/地区：</span>
+        <HostRegionBadge host={host} compact={regionCompact} />
+      </div>
+    </div>
+  );
+
   useEffect(() => {
     if (!metrics?.length) return;
     writeCachedHostMetrics(host.id, metrics);
@@ -294,8 +309,13 @@ export default function HostCard({
                 variant="ghost"
                 size="icon"
                 className="h-7 w-7 text-destructive hover:text-destructive"
-                onClick={() => {
-                  if (confirm("确定要删除此主机吗？")) onDelete(host.id);
+                onClick={async () => {
+                  if (await confirmDialog({
+                    title: "删除主机",
+                    description: "确定要删除此主机吗？删除后相关状态和配置会同步移除。",
+                    confirmText: "删除",
+                    tone: "destructive",
+                  })) onDelete(host.id);
                 }}
               >
                 <Trash2 className="h-3.5 w-3.5" />
@@ -303,13 +323,10 @@ export default function HostCard({
             </div>
           </div>
         ) : (
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-            <CardTitle className={`min-w-0 text-base font-semibold ${isOnline ? "" : "text-muted-foreground"}`}>
-              <span className="flex min-w-0 flex-wrap items-center gap-2">
-                <Monitor className="h-4 w-4 shrink-0" />
-                <span className="min-w-0 max-w-full truncate">{hostName}</span>
-              </span>
-            </CardTitle>
+          <div className="flex min-w-0 items-start justify-between gap-2">
+            <div className="flex min-w-0 items-center gap-2">
+              <Monitor className="h-4 w-4 shrink-0 text-muted-foreground" />
+            </div>
             <div className="flex shrink-0 items-center justify-end gap-1">
               {onViewProbeLatency && (
                 <Button
@@ -356,8 +373,13 @@ export default function HostCard({
                 variant="ghost"
                 size="icon"
                 className="h-7 w-7 text-destructive hover:text-destructive"
-                onClick={() => {
-                  if (confirm("确定要删除此主机吗？")) onDelete(host.id);
+                onClick={async () => {
+                  if (await confirmDialog({
+                    title: "删除主机",
+                    description: "确定要删除此主机吗？删除后相关状态和配置会同步移除。",
+                    confirmText: "删除",
+                    tone: "destructive",
+                  })) onDelete(host.id);
                 }}
               >
                 <Trash2 className="h-3.5 w-3.5" />
@@ -383,45 +405,56 @@ export default function HostCard({
                 >
                   {host.agentVersion ? `v${host.agentVersion}` : "未上报"}
                 </span>
+                {agentNeedsUpdate && (
+                  <Badge variant="outline" className="shrink-0 border-amber-500/30 px-1.5 py-0 text-[10px] text-amber-500">
+                    新版
+                  </Badge>
+                )}
               </div>
-              {(agentNeedsUpdate || host.agentUpgradeRequested) && (
+              {host.agentUpgradeRequested && (
                 <div className="mt-1 flex flex-wrap gap-1.5">
-                  {agentNeedsUpdate && (
-                    <Badge variant="outline" className="shrink-0 border-amber-500/30 px-1.5 py-0 text-[10px] text-amber-500">
-                      新版
-                    </Badge>
-                  )}
-                  {host.agentUpgradeRequested && (
-                    <Badge variant="outline" className={`shrink-0 px-1.5 py-0 text-[10px] ${agentUpgradeTimedOut ? "border-destructive/30 text-destructive" : "border-blue-500/30 text-blue-500"}`}>
-                      {agentUpgradeTimedOut ? "升级失败" : "升级中"}
-                    </Badge>
-                  )}
+                  <Badge variant="outline" className={`shrink-0 px-1.5 py-0 text-[10px] ${agentUpgradeTimedOut ? "border-destructive/30 text-destructive" : "border-blue-500/30 text-blue-500"}`}>
+                    {agentUpgradeTimedOut ? "升级失败" : "升级中"}
+                  </Badge>
                 </div>
               )}
-              <p className="truncate font-mono text-xs leading-5" title={hostPrimaryAddressText(host)}>
-                <span className="mr-1.5 text-muted-foreground">地址</span>
-                {hostPrimaryAddressText(host)}
-              </p>
-              <div className={`mt-1 ${isOnline ? "" : "opacity-70 grayscale"}`}>
-                <HostRegionBadge host={host} compact />
-              </div>
+              {addressRegionBlock(true)}
             </div>
           </div>
         ) : (
           <div className={compact ? "space-y-1.5" : "space-y-2"}>
             <div className={`min-w-0 rounded-md border px-2.5 ${compact ? "py-1.5" : "py-2"} ${infoPanelClass}`}>
-              <p className="truncate font-mono text-xs leading-5" title={hostPrimaryAddressText(host)}>
-                <span className="mr-1.5 text-muted-foreground">地址</span>
-                {hostPrimaryAddressText(host)}
-              </p>
-              <div className={`mt-1 ${isOnline ? "" : "opacity-70 grayscale"}`}>
-                <HostRegionBadge host={host} />
+              <div className="flex min-w-0 items-center gap-2">
+                <span
+                  className={`h-2 w-2 shrink-0 rounded-full ${isOnline ? "bg-chart-2 shadow-sm shadow-chart-2/50 animate-pulse" : "bg-destructive shadow-sm shadow-destructive/50"}`}
+                  title={isOnline ? "在线" : "离线"}
+                />
+                <span className="min-w-0 truncate text-sm font-semibold leading-5" title={hostName}>{hostName}</span>
+                <span
+                  className={`shrink-0 rounded border bg-background/40 px-1.5 py-0.5 font-mono text-[10px] font-normal leading-none text-muted-foreground ${
+                    isOnline ? "border-border/50" : "border-muted-foreground/20 bg-muted/20"
+                  }`}
+                >
+                  {host.agentVersion ? `v${host.agentVersion}` : "未上报"}
+                </span>
+                {agentNeedsUpdate && (
+                  <Badge variant="outline" className="shrink-0 border-amber-500/30 px-1.5 py-0 text-[10px] text-amber-500">
+                    新版
+                  </Badge>
+                )}
               </div>
+              {host.agentUpgradeRequested && (
+                <div className="mt-1 flex flex-wrap gap-1.5">
+                  <Badge variant="outline" className={`shrink-0 px-1.5 py-0 text-[10px] ${agentUpgradeTimedOut ? "border-destructive/30 text-destructive" : "border-blue-500/30 text-blue-500"}`}>
+                    {agentUpgradeTimedOut ? "升级失败" : "升级中"}
+                  </Badge>
+                </div>
+              )}
+              {addressRegionBlock(false)}
             </div>
             <div className={`flex min-w-0 items-center gap-3 overflow-hidden whitespace-nowrap ${compact ? "text-xs" : "text-sm"}`}>
               <div className="flex shrink-0 items-center gap-1.5">
                 <Activity className="h-3.5 w-3.5 text-muted-foreground" />
-                <span className={`h-2 w-2 rounded-full ${isOnline ? "bg-chart-2 shadow-sm shadow-chart-2/50 animate-pulse" : "bg-destructive shadow-sm shadow-destructive/50"}`} />
                 <span className={isOnline ? "" : "font-medium text-destructive"}>{isOnline ? "在线" : "离线"}</span>
               </div>
               {!compact && <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">

@@ -96,17 +96,18 @@ type replayCache struct {
 }
 
 const (
-	fxpHandshakeVersion = 2
-	fxpSaltSize         = 32
-	fxpMaxFrame         = 16 * 1024 * 1024
-	fxpEntryToExit      = uint32(1)
-	fxpExitToEntry      = uint32(2)
-	fxpHandshakeWindow  = 5 * time.Minute
-	fxpTCPKeepAlive     = 30 * time.Second
-	fxpHalfCloseLinger  = 30 * time.Second
-	fxpUDPIdleTimeout   = 2 * time.Minute
-	fxpMasterContext    = "forwardx-fxp-v2 master"
-	fxpRuntimeVersion   = "2.2.102"
+	fxpHandshakeVersion  = 2
+	fxpSaltSize          = 32
+	fxpMaxFrame          = 16 * 1024 * 1024
+	fxpEntryToExit       = uint32(1)
+	fxpExitToEntry       = uint32(2)
+	fxpHandshakeWindow   = 5 * time.Minute
+	fxpTCPKeepAlive      = 30 * time.Second
+	fxpHalfCloseLinger   = 30 * time.Second
+	fxpUDPIdleTimeout    = 2 * time.Minute
+	fxpProtocolSampleMax = 512
+	fxpMasterContext     = "forwardx-fxp-v2 master"
+	fxpRuntimeVersion    = "2.2.102"
 )
 
 var (
@@ -504,6 +505,7 @@ func runEntry(done <-chan struct{}, cfg config) error {
 		if err != nil {
 			return fmt.Errorf("entry udp listen :%d: %w", cfg.ListenPort, err)
 		}
+		tuneUDPConn(udpConn, "entry", fxpUDPListenBufferBytes)
 		log.Printf("entry udp listening on :%d tunnel=%d rule=%d", cfg.ListenPort, cfg.TunnelID, cfg.RuleID)
 		wg.Add(1)
 		go func() {
@@ -557,7 +559,7 @@ func handleEntryTCP(client net.Conn, cfg config, selector *exitEndpointSelector,
 	var first []byte
 	proxyInfo := proxyProtocolInfoFromConn(client)
 	initialTimeout := 150 * time.Millisecond
-	if cfg.ProxyProtocolReceive || cfg.BlockHTTP || cfg.BlockSocks || cfg.BlockTLS {
+	if cfg.ProxyProtocolReceive {
 		initialTimeout = 5 * time.Second
 	}
 	initial, err := readInitialTCPPayload(client, initialTimeout)
@@ -597,14 +599,6 @@ func handleEntryTCP(client net.Conn, cfg config, selector *exitEndpointSelector,
 	if !cfg.ProxyProtocolSend {
 		proxyInfo = proxyProtocolInfo{}
 	}
-	if cfg.BlockHTTP || cfg.BlockSocks || cfg.BlockTLS {
-		if len(first) == 0 {
-			// Keep server-first protocols working when no client payload arrives before the policy sniff timeout.
-		} else if proto := detectBlockedProtocol(first, protocolPolicy{BlockHTTP: cfg.BlockHTTP, BlockSocks: cfg.BlockSocks, BlockTLS: cfg.BlockTLS}); proto != "" {
-			reportProtocolBlock(cfg, proto)
-			return nil
-		}
-	}
 	exit, sec, endpoint, err := dialSelectedSecureTCP(selector, cfg)
 	if err != nil {
 		return fmt.Errorf("dial exit: %w", err)
@@ -628,17 +622,25 @@ func handleEntryTCP(client net.Conn, cfg config, selector *exitEndpointSelector,
 		return err
 	}
 	log.Printf("entry tcp routed tunnel=%d rule=%d client=%s exit=%s:%d target=%s:%d", cfg.TunnelID, cfg.RuleID, client.RemoteAddr(), endpoint.Host, endpoint.Port, cfg.TargetIP, cfg.TargetPort)
+	policy := protocolPolicy{BlockHTTP: cfg.BlockHTTP, BlockSocks: cfg.BlockSocks, BlockTLS: cfg.BlockTLS}
+	reportBlock := func(proto string) {
+		reportProtocolBlock(cfg, proto)
+	}
 	if len(first) > 0 {
 		inLimiter.wait(len(first))
 		if err := sec.writeFrame(first); err != nil {
 			return err
+		}
+		if proto := detectBlockedProtocol(first, policy); proto != "" {
+			reportBlock(proto)
+			return nil
 		}
 	}
 	counter := &trafficCounter{}
 	counter.in.Add(uint64(len(first)))
 	stopReporting := startTrafficReporter(cfg, counter)
 	defer stopReporting()
-	return proxyPlainSecure(client, sec, inLimiter, outLimiter, counter)
+	return proxyPlainSecureWithPolicy(client, sec, inLimiter, outLimiter, counter, policy, reportBlock, first)
 }
 
 func readInitialTCPPayload(conn net.Conn, timeout time.Duration) ([]byte, error) {
@@ -1066,7 +1068,7 @@ func newUDPEntrySession(conn *net.UDPConn, clientAddr *net.UDPAddr, cfg config, 
 		outLimiter:    outLimiter,
 		counter:       counter,
 		stopReporting: startTrafficReporter(cfg, counter),
-		send:          make(chan []byte, 256),
+		send:          make(chan []byte, fxpUDPStreamQueueSize),
 		done:          make(chan struct{}),
 		remove:        remove,
 	}
@@ -1091,7 +1093,7 @@ func (s *udpEntrySession) enqueue(payload []byte) {
 		return
 	case s.send <- payload:
 	default:
-		log.Printf("entry udp session queue full tunnel=%d rule=%d client=%s; dropping packet", s.cfg.TunnelID, s.cfg.RuleID, s.clientAddr)
+		fxpUDPDropLog.Printf("entry udp session queue full tunnel=%d rule=%d client=%s; dropping packet", s.cfg.TunnelID, s.cfg.RuleID, s.clientAddr)
 	}
 }
 
@@ -1203,6 +1205,7 @@ func runExit(done <-chan struct{}, cfg config) error {
 		if err != nil {
 			return fmt.Errorf("exit udp listen :%d: %w", cfg.ListenPort, err)
 		}
+		tuneUDPConn(udpConn, "exit", fxpUDPListenBufferBytes)
 		log.Printf("exit udp listening on :%d tunnel=%d", cfg.ListenPort, cfg.TunnelID)
 		wg.Add(1)
 		go func() {
@@ -1320,6 +1323,7 @@ func handleExitUDP(sec *secureConn, hello helloFrame) error {
 	if err != nil {
 		return err
 	}
+	tuneUDPConn(target, "exit target", fxpUDPSessionBufferBytes)
 	defer target.Close()
 	log.Printf("exit udp session routed tunnel=%d rule=%d peer=%s target=%s:%d", hello.TunnelID, hello.RuleID, sec.conn.RemoteAddr(), hello.TargetIP, hello.TargetPort)
 	var lastActivity atomic.Int64
@@ -1421,6 +1425,7 @@ func runRelay(done <-chan struct{}, cfg config) error {
 		if err != nil {
 			return fmt.Errorf("relay udp listen :%d: %w", cfg.ListenPort, err)
 		}
+		tuneUDPConn(udpConn, "relay", fxpUDPListenBufferBytes)
 		log.Printf("relay udp listening on :%d tunnel=%d next=%s:%d", cfg.ListenPort, cfg.TunnelID, cfg.RelayExitHost, cfg.RelayExitPort)
 		wg.Add(1)
 		go func() {
@@ -1540,13 +1545,19 @@ func relayCopy(src, dst *secureConn) error {
 }
 
 func proxyPlainSecure(plain net.Conn, sec *secureConn, inLimiter, outLimiter *limiter, counter *trafficCounter) error {
+	return proxyPlainSecureWithPolicy(plain, sec, inLimiter, outLimiter, counter, protocolPolicy{}, nil, nil)
+}
+
+func proxyPlainSecureWithPolicy(plain net.Conn, sec *secureConn, inLimiter, outLimiter *limiter, counter *trafficCounter, policy protocolPolicy, onBlock func(string), initialSample []byte) error {
 	errCh := make(chan error, 2)
 	var inCounter, outCounter *atomic.Uint64
 	if counter != nil {
 		inCounter = &counter.in
 		outCounter = &counter.out
 	}
-	go func() { errCh <- copyPlainToSecure(sec, plain, inLimiter, inCounter) }()
+	go func() {
+		errCh <- copyPlainToSecureWithPolicy(sec, plain, inLimiter, inCounter, policy, onBlock, initialSample)
+	}()
 	go func() { errCh <- copySecureToPlain(plain, sec, outLimiter, outCounter) }()
 	return waitBidirectional(errCh, func() {
 		_ = plain.Close()
@@ -1591,13 +1602,59 @@ func waitBidirectionalWithLinger(errCh <-chan error, closeAll func(), halfCloseL
 }
 
 func copyPlainToSecure(dst *secureConn, src net.Conn, limiter *limiter, counter *atomic.Uint64) error {
+	return copyPlainToSecureWithPolicy(dst, src, limiter, counter, protocolPolicy{}, nil, nil)
+}
+
+func copyPlainToSecureWithPolicy(dst *secureConn, src net.Conn, limiter *limiter, counter *atomic.Uint64, policy protocolPolicy, onBlock func(string), initialSample []byte) error {
 	buf := make([]byte, 32*1024)
+	sample := make([]byte, 0, fxpProtocolSampleMax)
+	if len(initialSample) > 0 {
+		n := len(initialSample)
+		if n > fxpProtocolSampleMax {
+			n = fxpProtocolSampleMax
+		}
+		sample = append(sample, initialSample[:n]...)
+	}
+	policyEnabled := policy.BlockHTTP || policy.BlockSocks || policy.BlockTLS
+	inspect := func(chunk []byte) (string, bool) {
+		if !policyEnabled || len(chunk) == 0 || len(sample) >= fxpProtocolSampleMax {
+			return "", false
+		}
+		remaining := fxpProtocolSampleMax - len(sample)
+		if remaining > len(chunk) {
+			remaining = len(chunk)
+		}
+		sample = append(sample, chunk[:remaining]...)
+		proto := detectBlockedProtocol(sample, policy)
+		return proto, proto != ""
+	}
+	firstData := len(initialSample) == 0
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
+			chunk := buf[:n]
 			limiter.wait(n)
-			if wErr := dst.writeFrame(buf[:n]); wErr != nil {
-				return wErr
+			if firstData {
+				firstData = false
+				if wErr := dst.writeFrame(chunk); wErr != nil {
+					return wErr
+				}
+				if proto, blocked := inspect(chunk); blocked {
+					if onBlock != nil {
+						go onBlock(proto)
+					}
+					return fmt.Errorf("protocol blocked: %s", proto)
+				}
+			} else {
+				if proto, blocked := inspect(chunk); blocked {
+					if onBlock != nil {
+						go onBlock(proto)
+					}
+					return fmt.Errorf("protocol blocked: %s", proto)
+				}
+				if wErr := dst.writeFrame(chunk); wErr != nil {
+					return wErr
+				}
 			}
 			if counter != nil {
 				counter.Add(uint64(n))
@@ -1854,10 +1911,14 @@ func (c *secureConn) writeEncryptedFrame(plain []byte) error {
 	dataNonce := fxpNonce(c.writeDir, counter, 1)
 	lenCipher := c.lenWriteAEAD.Seal(nil, lenNonce, lenPlain[:], c.lengthAD)
 	dataCipher := c.dataWriteAEAD.Seal(nil, dataNonce, plain, c.payloadAD)
-	if _, err := writeFull(c.conn, lenCipher); err != nil {
+	buffers := net.Buffers{lenCipher, dataCipher}
+	written, err := buffers.WriteTo(c.conn)
+	if err != nil {
 		return err
 	}
-	_, err := writeFull(c.conn, dataCipher)
+	if written != int64(len(lenCipher)+len(dataCipher)) {
+		return io.ErrShortWrite
+	}
 	return err
 }
 

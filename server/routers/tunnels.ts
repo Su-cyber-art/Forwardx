@@ -282,7 +282,7 @@ async function attachTunnelEndpointHosts(tunnels: any[]) {
         connectHost: String(node.connectHost || "").trim() || null,
         isEnabled: node.isEnabled !== false,
       }))
-      .filter((node) => node.hostId > 0);
+      .filter((node: any) => node.hostId > 0);
     if (normalizedExtraExitNodes.length > 0) {
       extraExitNodesByTunnel.set(Number(tunnel.id), normalizedExtraExitNodes);
       for (const node of normalizedExtraExitNodes) hostIds.add(Number(node.hostId));
@@ -312,6 +312,7 @@ async function attachTunnelEndpointHosts(tunnels: any[]) {
     }
   }));
   const latestLatencyByTunnel = await db.getLatestTunnelLatencies(tunnels.map((tunnel) => Number(tunnel.id)));
+  const latestLatencySeriesByTunnel = await db.getLatestTunnelLatencySeries(tunnels.map((tunnel) => Number(tunnel.id)));
   await Promise.all(Array.from(hostIds).map(async (hostId) => {
     const host = await db.getHostById(hostId);
     if (host) hostMap.set(hostId, host);
@@ -333,6 +334,7 @@ async function attachTunnelEndpointHosts(tunnels: any[]) {
   } : null;
   return tunnels.map((tunnel) => {
     const latestLatency = latestLatencyByTunnel.get(Number(tunnel.id));
+    const latestLatencySeries = latestLatencySeriesByTunnel.get(Number(tunnel.id)) || [];
     const fallbackLatency = typeof (tunnel as any).lastLatencyMs === "number" && Number.isFinite((tunnel as any).lastLatencyMs)
       ? Number((tunnel as any).lastLatencyMs)
       : null;
@@ -344,6 +346,7 @@ async function attachTunnelEndpointHosts(tunnels: any[]) {
         : fallbackLatency,
       latestLatencyIsTimeout: latestLatency ? latestLatency.isTimeout : fallbackTimeout,
       latestLatencyAt: latestLatency?.recordedAt ?? (tunnel as any).lastTestAt ?? null,
+      latestLatencySeries,
       hopHostIds: hopHostIdsByTunnel.get(Number(tunnel.id)) || [],
       hopConnectHosts: hopConnectHostsByTunnel.get(Number(tunnel.id)) || [],
       hopHosts: (hopHostIdsByTunnel.get(Number(tunnel.id)) || [])
@@ -386,10 +389,10 @@ export const tunnelsRouter = router({
       return attachTunnelEndpointHosts(await db.getTunnels() as any[]);
     }),
     latencySeries: protectedProcedure
-      .input(z.object({
-        tunnelId: z.number(),
-        hours: z.number().min(1).max(48).default(24),
-      }))
+    .input(z.object({
+      tunnelId: z.number(),
+      hours: z.number().min(1).max(24 * 3).default(24),
+    }))
       .query(async ({ input, ctx }) => {
         const tunnel = await db.getTunnelById(input.tunnelId);
         if (!tunnel) throw new Error("Tunnel not found");
@@ -603,7 +606,7 @@ export const tunnelsRouter = router({
         }
         const hopIdsForConnect = hopHostIds || (!switchToRegular && existingHopHostIds.length >= 3 ? existingHopHostIds : null);
         const hopConnectHosts = hopIdsForConnect
-          ? hopIdsForConnect.map((_, index) => (
+          ? hopIdsForConnect.map((_: number, index: number) => (
             hopConnectHostsProvided && rawHopConnectHosts[index] !== undefined
               ? rawHopConnectHosts[index]
               : hopHostIds
@@ -787,22 +790,27 @@ export const tunnelsRouter = router({
         if (keyChanged) {
           const existingExtraHostIds = (existingExtraExitNodes || []).map((node: any) => Number(node.hostId)).filter((hostId: number) => Number.isFinite(hostId) && hostId > 0);
           const nextExtraHostIds = extraExitNodes.map((node) => Number(node.hostId)).filter((hostId) => Number.isFinite(hostId) && hostId > 0);
-          const affectedHopHostIds = Array.from(new Set([...existingHopHostIds, ...normalizedRequestedHopIds, ...existingExtraHostIds, ...nextExtraHostIds]));
-          const hasMultiHopRuntime = existingHopHostIds.length >= 3 || normalizedRequestedHopIds.length >= 3;
-          if (hasMultiHopRuntime) {
-            await refreshTunnelRuntimeHosts(id, affectedHopHostIds, hopChanged ? "tunnel-hop-updated" : "tunnel-updated");
-          } else {
-            clearTunnelRuntimeStatus(id);
-            await pushTunnelEndpointRefresh({ ...tunnel, entryHostId, exitHostId }, "tunnel-updated");
-          }
-          const endpointHostIds = [tunnel.entryHostId, tunnel.exitHostId, entryHostId, exitHostId, ...existingExtraHostIds, ...nextExtraHostIds]
-            .map((hostId) => Number(hostId))
-            .filter((hostId) => Number.isFinite(hostId) && hostId > 0);
-          for (const hostId of Array.from(new Set(endpointHostIds))) {
-            pushAgentRefresh(hostId, "tunnel-runtime-sync");
-          }
-          if (tunnel.entryHostId !== entryHostId) pushAgentRefresh(tunnel.entryHostId, "tunnel-updated-old-entry");
-          if (tunnel.exitHostId !== exitHostId) pushAgentRefresh(tunnel.exitHostId, "tunnel-updated-old-exit");
+          const previousEntryHostIds = await getTunnelEntryTestHostIds(tunnel);
+          const nextEntryHostIds = await getTunnelEntryTestHostIds({
+            ...tunnel,
+            ...data,
+            entryHostId,
+            exitHostId,
+            entryGroupId: (data as any).entryGroupId !== undefined ? (data as any).entryGroupId : (tunnel as any).entryGroupId,
+          });
+          const affectedHostIds = [
+            ...previousEntryHostIds,
+            ...nextEntryHostIds,
+            (tunnel as any).entryHostId,
+            (tunnel as any).exitHostId,
+            entryHostId,
+            exitHostId,
+            ...existingHopHostIds,
+            ...normalizedRequestedHopIds,
+            ...existingExtraHostIds,
+            ...nextExtraHostIds,
+          ];
+          await refreshTunnelRuntimeHosts(id, affectedHostIds, hopChanged ? "tunnel-hop-updated" : "tunnel-updated");
         }
         return { success: true, reset: keyChanged };
       }),

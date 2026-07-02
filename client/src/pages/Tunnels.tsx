@@ -46,7 +46,8 @@ import { countryFeatureHasCode, normalizeCountryCode, type CountryFeatureLike } 
 import { applyLatencyPeakCut, clipLatencyForChart, getLatencyStabilityStats, getLatencyYAxisMax, getLatencyYAxisTicks, isLatencySeriesCacheFresh } from "@/lib/latencyChart";
 import { useUrlTab } from "@/hooks/useUrlTab";
 import { addHostNodeMeta, hostDisplayName } from "@/lib/linkTestNodeMeta";
-import { getTunnelHopIds, getTunnelRouteText, tunnelHopHostName } from "@/lib/tunnelDisplay";
+import { pollingInterval } from "@/lib/polling";
+import { getTunnelExitNames, getTunnelHopIds, getTunnelLoadBalanceExitNames, getTunnelRouteText, tunnelHopHostName } from "@/lib/tunnelDisplay";
 import { trpc } from "@/lib/trpc";
 import {
   Activity,
@@ -466,6 +467,18 @@ function tunnelLatestStatLatencyMs(tunnel: any) {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Number(value) : null;
 }
 
+function tunnelSeriesLatencyEntries(tunnel: any) {
+  if (!Array.isArray(tunnel?.latestLatencySeries)) return [];
+  return tunnel.latestLatencySeries
+    .map((item: any) => ({
+      key: normalizeTunnelLatencySeriesKey(item?.seriesKey),
+      label: tunnelLatencySeriesDisplayName(normalizeTunnelLatencySeriesKey(item?.seriesKey), item?.seriesLabel),
+      latencyMs: typeof item?.latencyMs === "number" && Number.isFinite(item.latencyMs) ? Number(item.latencyMs) : null,
+      isTimeout: !!item?.isTimeout,
+    }))
+    .filter((item: any) => item.key !== "total");
+}
+
 function hasStructuredTunnelTestMessage(parsed: ReturnType<typeof parseLinkTestMessage>) {
   return !!parsed?.details?.length || typeof parsed?.totalLatencyMs === "number";
 }
@@ -486,6 +499,23 @@ function tunnelDisplayLatencyMs(tunnel: any) {
   if (structuredMessage || isSuccess || isFailed || latency !== null) return latency;
   if (latestFallback !== null) return latestFallback;
   return manualFallback;
+}
+
+function tunnelDisplayLatencyList(tunnel: any) {
+  const entries = tunnelSeriesLatencyEntries(tunnel);
+  if (entries.length === 0) {
+    const value = tunnelDisplayLatencyMs(tunnel);
+    return typeof value === "number" && Number.isFinite(value)
+      ? [{ label: "总延迟", latencyMs: value, isTimeout: false, key: "total" }]
+      : tunnelLatencyIsTimeout(tunnel)
+        ? [{ label: "总延迟", latencyMs: null, isTimeout: true, key: "total" }]
+        : [];
+  }
+  const total = tunnel?.latestLatencyMs;
+  const totalEntry = typeof total === "number" && Number.isFinite(total)
+    ? [{ label: "总延迟", latencyMs: Number(total), isTimeout: !!tunnel?.latestLatencyIsTimeout, key: "total" }]
+    : [];
+  return [...totalEntry, ...entries];
 }
 
 function tunnelLatencyIsTimeout(tunnel: any) {
@@ -807,7 +837,7 @@ function TunnelWorldGlobe({
         kind: "tunnel",
         item: tunnel,
         name: String(tunnel.name || `隧道 #${tunnel.id}`),
-        routeText: routeHosts.map((host) => host.name).join(" -> "),
+        routeText: getTunnelRouteText(tunnel, hosts),
         routeHosts,
         statusText: !supported ? "协议未启用" : active ? "运行中" : enabled ? "已启用" : "已停用",
         latencyText: formatGlobeLatency(tunnelDisplayLatencyMs(tunnel), tunnelLatencyIsTimeout(tunnel)),
@@ -913,6 +943,7 @@ function TunnelWorldGlobe({
           ...link,
           item: tunnel,
           name: String(tunnel.name || `隧道 #${tunnel.id}`),
+          routeText: getTunnelRouteText(tunnel, hosts),
           statusText: !supported ? "协议未启用" : active ? "运行中" : enabled ? "已启用" : "已停用",
           latencyText: formatGlobeLatency(tunnelDisplayLatencyMs(tunnel), tunnelLatencyIsTimeout(tunnel)),
           color: active ? "#4ade80" : enabled ? "#fbbf24" : "#94a3b8",
@@ -1135,7 +1166,7 @@ function TunnelLatencyDialog({
   const [peakCutEnabled, setPeakCutEnabled] = useState(false);
   const { data, isLoading, isFetching } = trpc.tunnels.latencySeries.useQuery(
     { tunnelId, hours: 24 },
-    { enabled: open, refetchInterval: open ? 30000 : false, refetchOnMount: "always" }
+    { enabled: open, refetchInterval: pollingInterval("slow", open), refetchOnMount: "always" }
   );
   const cachedData = tunnelLatencySeriesCache.get(tunnelId);
   const rawSeriesData = (data ?? cachedData) as TunnelLatencySeriesDatum[] | undefined;
@@ -1301,7 +1332,9 @@ function TunnelLatencyDialog({
                     strokeLinejoin="round"
                     dot={(props: any) => props?.payload?.[meta.timeoutKey] ? (
                       <circle cx={props.cx} cy={props.cy} r={3} fill="var(--color-destructive)" stroke="var(--color-background)" strokeWidth={1.5} />
-                    ) : false}
+                    ) : (
+                      <circle cx={props.cx} cy={props.cy} r={0} fill="transparent" />
+                    )}
                     activeDot={{ r: 4, fill: meta.color, stroke: "var(--color-background)", strokeWidth: 2 }}
                     connectNulls={false}
                     isAnimationActive={shouldAnimateChart}
@@ -1349,7 +1382,7 @@ function TunnelSelfTestDialog({
   const utils = trpc.useUtils();
   const { data: tunnels } = trpc.tunnels.list.useQuery(undefined, {
     enabled: open,
-    refetchInterval: open ? 1500 : false,
+    refetchInterval: pollingInterval("interactive", open),
     refetchOnWindowFocus: false,
   });
   const tunnel = useMemo(() => tunnels?.find((item: any) => item.id === tunnelId), [tunnels, tunnelId]);
@@ -1383,6 +1416,7 @@ function TunnelSelfTestDialog({
   const displayTesting = isTesting || hasPendingDetails;
   const linkTestNodeData = useMemo(() => {
     const meta: Record<string, any> = {};
+    const nodeTooltips: Record<string, ReactNode> = {};
     const fullHostById = new Map<number, any>((hosts || []).map((host: any) => [Number(host.id), host]));
     const tunnelHostById = new Map<number, any>();
     [
@@ -1444,7 +1478,7 @@ function TunnelSelfTestDialog({
         toMeta: nodeMetaFor(toHost, nextHostId),
       };
     }).filter((segment: LinkTestPlannedSegment) => segment.from && segment.to);
-    const entryHostIds = Array.from(new Set((
+    const entryHostIds = Array.from(new Set<number>((
       entryGroupMembers.length > 0
         ? entryGroupMembers.map((member: any) => Number(member?.hostId || 0))
         : [firstHostId]
@@ -1454,7 +1488,7 @@ function TunnelSelfTestDialog({
       const nextHostId = Number(restHopIds[0] || lastHostId || tunnel?.exitHostId || 0);
       const nextHost = hostForId(nextHostId);
       const nextLabel = labelForHostId(nextHostId);
-      const entrySegments: LinkTestPlannedSegment[] = entryHostIds.map((entryHostId) => {
+      const entrySegments: LinkTestPlannedSegment[] = entryHostIds.map((entryHostId: number) => {
         const entryHost = hostForId(entryHostId);
         return {
           from: labelForHostId(entryHostId),
@@ -1481,6 +1515,113 @@ function TunnelSelfTestDialog({
         .filter((exit: any) => Number(exit?.hostId || 0) > 0)
         .sort((a: any, b: any) => Number(a?.seq || 0) - Number(b?.seq || 0))
       : [];
+    const primaryExitLabel = lastHostId ? labelForHostId(lastHostId) : "";
+    if (primaryExitLabel && extraExits.length > 0) {
+      const entryReferenceLabel = entryHostIds.length > 1
+        ? "入口组"
+        : firstHostId
+          ? labelForHostId(firstHostId)
+          : "入口";
+      const exitRows = [
+        {
+          hostId: lastHostId,
+          label: primaryExitLabel,
+          role: "主出口",
+          connectHost: String(tunnel?.connectHost || "").trim(),
+          listenPort: Number(tunnel?.listenPort || 0) || null,
+        },
+        ...extraExits.map((exit: any, index: number) => {
+          const hostId = Number(exit?.hostId || 0);
+          return {
+            hostId,
+            label: labelForHostId(hostId),
+            role: `备用出口 ${index + 1}`,
+            connectHost: String(exit?.connectHost || "").trim(),
+            listenPort: Number(exit?.listenPort || 0) || null,
+          };
+        }),
+      ].filter((row) => row.hostId > 0);
+      const detailByTarget = new Map<string, any>();
+      const detailByHostId = new Map<number, any>();
+      const detailByIndex = new Map<number, any>();
+      (parsedMessage.details || []).forEach((detail: any, index: number) => {
+        const route = String(detail?.routeLabel || detail?.hopLabel || "").trim();
+        const match = route.match(/->\s*(.+)$/);
+        const target = String(match?.[1] || "").trim();
+        if (target) detailByTarget.set(target.toLowerCase(), { detail, index });
+        const idMatch = String(detail?.hopLabel || "").match(/->\s*(\d+)\s*$/);
+        const targetHostId = Number(idMatch?.[1] || 0);
+        if (targetHostId > 0) detailByHostId.set(targetHostId, { detail, index });
+        detailByIndex.set(index, { detail, index });
+      });
+      const latestSeries = Array.isArray(tunnel?.latestLatencySeries) ? tunnel.latestLatencySeries : [];
+      const latestSeriesByKey = new Map<string, any>();
+      latestSeries.forEach((item: any) => {
+        const key = String(item?.seriesKey || "").trim().toLowerCase();
+        if (key) latestSeriesByKey.set(key, item);
+      });
+      const detailForExitRow = (row: { hostId: number; label: string }, index: number) => (
+        detailByHostId.get(row.hostId)
+        || detailByTarget.get(row.label.toLowerCase())
+        || detailByIndex.get(index)
+        || null
+      );
+      const latestForExitRow = (index: number) => (
+        latestSeriesByKey.get(index === 0 ? "primary" : `exit-${index + 1}`)
+        || null
+      );
+      const tooltip = (
+        <div className="min-w-[240px] space-y-2">
+          <div>
+            <div className="text-sm font-semibold">出口组</div>
+            <div className="text-[11px] text-muted-foreground">主图仅展示主出口，备用出口在此查看。相对入口：{entryReferenceLabel}</div>
+          </div>
+          <div className="space-y-1.5">
+            {exitRows.map((row, index) => {
+              const detailRecord = detailForExitRow(row, index);
+              const detail = detailRecord?.detail;
+              const latest = latestForExitRow(index);
+              const latestLatency = typeof latest?.latencyMs === "number" && Number.isFinite(latest.latencyMs) ? Number(latest.latencyMs) : null;
+              const latestTimeout = latest?.isTimeout === true;
+              const pending = detail?.pending === true || displayTesting;
+              const failed = !pending && (detail ? detail.success === false : latestTimeout);
+              const success = pending || !failed;
+              const latency = typeof detail?.latencyMs === "number" && Number.isFinite(detail.latencyMs)
+                ? `${detail.latencyMs}ms`
+                : pending
+                  ? "探测中"
+                  : detail
+                    ? "失败"
+                    : latestLatency !== null
+                      ? `${latestLatency}ms`
+                      : latestTimeout
+                        ? "失败"
+                        : "--";
+              return (
+                <div key={`${row.role}-${row.hostId}`} className="rounded border border-border/60 bg-background/70 px-2 py-1.5">
+                  <div className="flex min-w-0 items-center justify-between gap-3">
+                    <span className="min-w-0 truncate font-medium">{row.label}</span>
+                    <span className={success ? "shrink-0 text-emerald-600 dark:text-emerald-400" : "shrink-0 text-destructive"}>{latency}</span>
+                  </div>
+                  <div className="mt-1 flex min-w-0 items-center justify-between gap-3 text-[11px] text-muted-foreground">
+                    <span>{row.role}</span>
+                    <span className="min-w-0 truncate">{[row.connectHost, row.listenPort ? `:${row.listenPort}` : ""].filter(Boolean).join("") || "默认连接地址"}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+      [
+        primaryExitLabel,
+        primaryExitLabel.toLowerCase(),
+        meta[primaryExitLabel]?.label,
+        meta[primaryExitLabel]?.label?.toLowerCase(),
+      ].filter(Boolean).forEach((key: any) => {
+        nodeTooltips[String(key)] = tooltip;
+      });
+    }
     if (entryHostIds.length <= 1 && hopIds.length === 2 && tunnel?.loadBalanceEnabled && extraExits.length > 0) {
       const entryHost = hostForId(firstHostId);
       const entryLabel = hostDisplayName(entryHost) || (firstHostId ? tunnelHopHostName(tunnel, firstHostId, hosts) : tunnelName);
@@ -1507,15 +1648,16 @@ function TunnelSelfTestDialog({
           groupLabel: "多出口负载",
         });
       }
-      plannedSegments = branchSegments.filter((segment: LinkTestPlannedSegment) => segment.from && segment.to);
+      plannedSegments = branchSegments.slice(0, 1).filter((segment: LinkTestPlannedSegment) => segment.from && segment.to);
     }
     return {
       nodeMeta: meta,
+      nodeTooltips,
       sourceLabel: firstHostId ? labelForHostId(firstHostId) : tunnelName,
       targetLabel: lastHostId ? labelForHostId(lastHostId) : tunnelName,
       plannedSegments,
     };
-  }, [entryGroups, hosts, tunnel, tunnelName]);
+  }, [displayTesting, entryGroups, hosts, parsedMessage.details, tunnel, tunnelName]);
 
   useEffect(() => {
     if (!open) {
@@ -1590,6 +1732,7 @@ function TunnelSelfTestDialog({
           sourceLabel={linkTestNodeData.sourceLabel}
           targetLabel={linkTestNodeData.targetLabel}
           nodeMeta={linkTestNodeData.nodeMeta}
+          nodeTooltips={linkTestNodeData.nodeTooltips}
           plannedSegments={linkTestNodeData.plannedSegments}
         />
 
@@ -1652,9 +1795,9 @@ function groupHostSummary(group: any, hosts: any[] | undefined) {
 
 function TunnelsContent() {
   const utils = trpc.useUtils();
-  const { data: tunnels, isLoading } = trpc.tunnels.list.useQuery(undefined, { refetchInterval: 3000 });
+  const { data: tunnels, isLoading } = trpc.tunnels.list.useQuery(undefined, { refetchInterval: pollingInterval("active") });
   const { data: hosts } = trpc.hosts.list.useQuery();
-  const { data: forwardGroups, isLoading: forwardGroupsLoading } = trpc.forwardGroups.list.useQuery(undefined, { refetchInterval: 15000 });
+  const { data: forwardGroups, isLoading: forwardGroupsLoading } = trpc.forwardGroups.list.useQuery(undefined, { refetchInterval: pollingInterval("normal") });
   const { data: systemSettings } = trpc.system.getSettings.useQuery();
   const [showDialog, setShowDialog] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
@@ -1872,19 +2015,44 @@ function TunnelsContent() {
   };
   const renderTunnelRoute = (tunnel: any, compact = false) => {
     const hopIds = getTunnelHopIds(tunnel);
+    const entryGroup = Number(tunnel?.entryGroupId || 0) > 0 ? entryGroupById.get(Number(tunnel.entryGroupId)) : null;
+    const entryGroupLabel = entryGroup
+      ? `${String(entryGroup.name || "入口组").trim()}${String(entryGroup.domain || "").trim() ? ` (${String(entryGroup.domain).trim()})` : ""}`
+      : "";
+    const visibleHopIds = entryGroup
+      ? hopIds.filter((hostId: number) => !entryMembersForGroup(Number(entryGroup.id)).some((member: any) => Number(member.hostId || 0) === Number(hostId)))
+      : hopIds;
+    const extraExitNames = getTunnelLoadBalanceExitNames(tunnel, hosts);
+    const exitNames = extraExitNames.length > 0 ? getTunnelExitNames(tunnel, hosts) : [];
+    const routeTitle = [
+      entryGroupLabel ? `入口组：${entryGroupLabel}` : "",
+      getTunnelRouteText(tunnel, hosts),
+    ].filter(Boolean).join("；");
     return (
       <div
-        className={`flex min-w-0 items-center gap-1.5 text-xs ${compact ? "flex-wrap" : "whitespace-nowrap"}`}
-        title={getTunnelRouteText(tunnel, hosts)}
+        className={`flex min-w-0 items-center gap-1.5 text-xs ${compact || exitNames.length > 0 ? "flex-wrap" : "whitespace-nowrap"}`}
+        title={routeTitle}
       >
-        {hopIds.map((hostId: number, index: number) => (
+        {entryGroupLabel && (
+          <span className="flex min-w-0 items-center gap-1 rounded border border-primary/20 bg-primary/5 px-1.5 py-0.5 text-primary">
+            <span className="shrink-0">入口组</span>
+            <span className={compact ? "max-w-[10rem] truncate" : "min-w-0 truncate"}>{entryGroupLabel}</span>
+          </span>
+        )}
+        {visibleHopIds.map((hostId: number, index: number) => (
           <Fragment key={`${tunnel.id || "tunnel"}-${hostId}-${index}`}>
-            {index > 0 && <ArrowRight className="h-3 w-3 shrink-0 text-muted-foreground" />}
+            {(index > 0 || entryGroupLabel) && <ArrowRight className="h-3 w-3 shrink-0 text-muted-foreground" />}
             <span className={compact ? "max-w-[8rem] truncate" : "truncate"}>
               {tunnelHopHostName(tunnel, hostId, hosts)}
             </span>
           </Fragment>
         ))}
+        {exitNames.length > 0 && (
+          <span className="flex min-w-0 items-center gap-1 rounded border border-border/50 bg-muted/30 px-1.5 py-0.5 text-muted-foreground">
+            <span className="shrink-0">出口</span>
+            <span className="min-w-0 truncate">{exitNames.join(" / ")}</span>
+          </span>
+        )}
       </div>
     );
   };
@@ -2343,6 +2511,29 @@ function TunnelsContent() {
     return <span className={compact ? "text-xs text-muted-foreground" : "text-muted-foreground"}>未测试</span>;
   };
 
+  const renderTunnelLatencyBreakdown = (tunnel: any, compact = false) => {
+    const items = tunnelDisplayLatencyList(tunnel);
+    if (items.length === 0) {
+      return <span className={compact ? "text-xs text-muted-foreground" : "text-muted-foreground"}>未测试</span>;
+    }
+    return (
+      <div className="space-y-1">
+        {items.map((item) => (
+          <div key={item.key} className="flex min-w-0 items-center justify-between gap-2 whitespace-nowrap text-xs">
+            <span className="min-w-0 truncate text-muted-foreground">{item.label}</span>
+            <LatencyRating
+              latencyMs={item.latencyMs}
+              isTimeout={item.isTimeout}
+              icon="none"
+              timeoutText="不可达"
+              className={compact ? "shrink-0 text-[10px]" : "shrink-0"}
+            />
+          </div>
+        ))}
+      </div>
+    );
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -2493,9 +2684,9 @@ function TunnelsContent() {
                       </div>
                     </div>
 
-                    <div className="flex items-center justify-between gap-3 text-xs">
+                    <div className="space-y-1 text-xs">
                       <span className="text-muted-foreground">延迟</span>
-                      {renderTunnelLatencyLabel(tunnel)}
+                      {renderTunnelLatencyBreakdown(tunnel, true)}
                     </div>
 
                     <div className="flex justify-end gap-1 border-t border-border/40 pt-2">
@@ -2571,9 +2762,9 @@ function TunnelsContent() {
                       </div>
                     </div>
 
-                    <div className="flex items-center justify-between gap-3 text-xs">
+                    <div className="space-y-1 text-xs">
                       <span className="text-muted-foreground">延迟</span>
-                      {renderTunnelLatencyLabel(tunnel)}
+                      {renderTunnelLatencyBreakdown(tunnel, true)}
                     </div>
 
                     <div className="flex justify-end gap-1 border-t border-border/40 pt-2">
@@ -2652,7 +2843,7 @@ function TunnelsContent() {
                         </div>
                       </TableCell>
                       <TableCell className="hidden md:table-cell">
-                        {renderTunnelLatencyLabel(tunnel, true)}
+                        {renderTunnelLatencyBreakdown(tunnel, true)}
                       </TableCell>
                       <TableCell>
                         {supported ? (

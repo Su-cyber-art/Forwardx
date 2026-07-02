@@ -1,5 +1,6 @@
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { ConfirmDialogProvider } from "@/components/ui/confirm-dialog";
 import { useAuth } from "@/_core/hooks/useAuth";
 import type { ComponentType } from "react";
 import { trpc } from "@/lib/trpc";
@@ -9,6 +10,7 @@ import Login from "@/pages/Login";
 import { Redirect, Route, Switch, useLocation } from "wouter";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { ThemeProvider } from "./contexts/ThemeContext";
+import PersonalizationLayer from "./components/PersonalizationLayer";
 import Home from "./pages/Home";
 import Hosts from "./pages/Hosts";
 import Rules from "./pages/Rules";
@@ -29,7 +31,6 @@ import EmailSettings from "./pages/EmailSettings";
 import HomepagePreview from "./pages/HomepagePreview";
 import LookingGlass from "./pages/LookingGlass";
 import TrafficBilling from "./pages/TrafficBilling";
-import PersonalizationLayer from "./components/PersonalizationLayer";
 
 function AdminRoute({ component: Component }: { component: ComponentType }) {
   const { user, loading } = useAuth();
@@ -118,9 +119,11 @@ function App() {
     <ErrorBoundary>
       <ThemeProvider defaultTheme="light">
         <TooltipProvider>
-          <PersonalizationLayer />
-          <Toaster />
-          <SetupGate />
+          <ConfirmDialogProvider>
+            <PersonalizationLayer />
+            <Toaster />
+            <SetupGate />
+          </ConfirmDialogProvider>
         </TooltipProvider>
       </ThemeProvider>
     </ErrorBoundary>
