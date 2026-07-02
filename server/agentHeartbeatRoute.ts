@@ -11,7 +11,7 @@ import {
   isRuleProtocolEnabled,
   isTunnelProtocolEnabled,
 } from "./forwardProtocolSettings";
-import { clearTunnelRuntimeStatusForHost, isTunnelRuntimeHostReady } from "./tunnelRuntimeStatus";
+import { clearTunnelRuntimeStatusForHost, getTunnelRuntimeGeneration, isTunnelRuntimeHostReady } from "./tunnelRuntimeStatus";
 import { appendPanelLog } from "./_core/panelLogger";
 import { isIP } from "net";
 import { resolve4, resolve6 } from "dns/promises";
@@ -31,6 +31,7 @@ import {
   removeManagedServiceCmd,
   restartManagedServiceIfConfigChangedCmd,
   shQuote,
+  startManagedServiceCmd,
   stopManagedServiceCmd,
   writeManagedServiceCmd,
 } from "./agentActionCommands";
@@ -52,6 +53,7 @@ const AGENT_DNS_RESOLVE_TTL_MS = 5 * 60 * 1000;
 const resolvedIpCache = new Map<number, { raw: string; ip: string }>();
 const resolvedIpCheckedAt = new Map<number, number>();
 const tunnelRouteLogCache = new Map<string, string>();
+const nginxRuntimeLogCache = new Map<number, string>();
 const dnsRuntimeGenerationByKey = new Map<string, number>();
 const agentActionBatchCache = new Map<number, { signature: string; issuedAt: number; seenAt: number }>();
 const RUNTIME_BIN = "/usr/local/bin/forwardx-runtime";
@@ -64,12 +66,14 @@ const NGINX_BIN = "/usr/local/bin/forwardx-nginx";
 const NGINX_SERVICE_NAME = "forwardx-nginx";
 const NGINX_CONFIG_DIR = "/etc/forwardx/nginx";
 const NGINX_CONFIG_PATH = "/etc/forwardx/nginx/nginx.conf";
+const NGINX_STAGED_CONFIG_PATH = "/etc/forwardx/nginx/nginx.conf.next";
 const NGINX_CERT_DIR = "/etc/forwardx/nginx/certs";
 const REALM_CONFIG_DIR = "/etc/forwardx/realm";
 const LEGACY_GOST_SERVICE_NAME = "forwardx-gost";
 const LEGACY_TUNNEL_SERVICE_NAME = "forwardx-tunnels";
 const MIMIC_CONFIG_DIR = "/etc/mimic";
 const AGENT_FIREWALL_COUNTER_REFRESH_VERSION = "2.2.108";
+const AGENT_PROTOCOL_GUARD_BACKEND_VERSION = "2.2.127";
 const AGENT_ACTION_BATCH_REUSE_MS = 45 * 1000;
 const VERBOSE_AGENT_ACTIONS = /^(1|true|yes|on)$/i.test(String(process.env.FORWARDX_VERBOSE_AGENT_ACTIONS || ""));
 const BYTES_PER_MEGABIT = 1_000_000 / 8;
@@ -181,6 +185,10 @@ function realmTomlString(value: unknown) {
 
 function realmConfigPathForPort(port: unknown) {
   return `${REALM_CONFIG_DIR}/forwardx-realm-${Number(port) || 0}.toml`;
+}
+
+function realmGuardConfigPathForPort(port: unknown) {
+  return `${REALM_CONFIG_DIR}/forwardx-realm-guard-${Number(port) || 0}.toml`;
 }
 
 function mimicFilterEndpoint(host: unknown, port: unknown) {
@@ -310,6 +318,8 @@ function ensureNginxBinaryCmd() {
 
 export function registerAgentHeartbeatRoute(agentRouter: Router) {
 agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => {
+  let logHostId = 0;
+  let logHostName = "";
   try {
     const token = getResolvedAgentToken(req);
     const host = await getAgentHostFromRequest(req);
@@ -326,6 +336,8 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
       res.status(401).json({ error: "Invalid token" });
       return;
     }
+    logHostId = Number((host as any).id || 0);
+    logHostName = String((host as any).name || "").trim();
 
     const { cpuUsage, cpuInfo, memoryUsage, memoryUsed, memoryTotal, swapUsage, swapUsed, swapTotal, networkIn, networkOut, diskUsage, diskUsed, diskTotal, uptime, agentVersion } = req.body;
     const nextCpuInfo = normalizeAgentText(cpuInfo, 256);
@@ -353,6 +365,9 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
     const upgradedFirewallCounterAgent = !!nextAgentVersion
       && isAgentVersionAtLeast(nextAgentVersion, AGENT_FIREWALL_COUNTER_REFRESH_VERSION)
       && !isAgentVersionAtLeast(previousHost.agentVersion, AGENT_FIREWALL_COUNTER_REFRESH_VERSION);
+    const upgradedProtocolGuardBackendAgent = !!nextAgentVersion
+      && isAgentVersionAtLeast(nextAgentVersion, AGENT_PROTOCOL_GUARD_BACKEND_VERSION)
+      && !isAgentVersionAtLeast(previousHost.agentVersion, AGENT_PROTOCOL_GUARD_BACKEND_VERSION);
 
     await db.updateHostHeartbeat(host.id, {
       ip: reportedAddress.ip,
@@ -388,6 +403,12 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
       clearTunnelRuntimeStatusForHost(host.id);
       await refreshAgentsAffectedByHostAddress(host.id, "agent-firewall-counter-upgrade");
       appendPanelLog("info", `[AgentUpgrade] host=${host.id} agent=${nextAgentVersion} runtime state marked for firewall counter refresh`);
+    }
+    if (upgradedProtocolGuardBackendAgent) {
+      await db.resetAgentRuntimeStateForHost(host.id);
+      clearTunnelRuntimeStatusForHost(host.id);
+      await refreshAgentsAffectedByHostAddress(host.id, "agent-protocol-guard-backend-upgrade");
+      appendPanelLog("info", `[AgentUpgrade] host=${host.id} agent=${nextAgentVersion} runtime state marked for protocol guard backend refresh`);
     }
     if (dnsChangedReports.length > 0) {
       appendPanelLog("info", `[AgentDNS] host=${host.id} reported DNS change for ${dnsChangedReports.length} watched name(s); rule-specific refresh only`);
@@ -740,6 +761,18 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
     const dnsRuntimeRefreshCmd = (label: string) => (
       dnsRuntimeRefreshToken ? `echo ${shQuote(`[dns] ${label} refresh ${dnsRuntimeRefreshToken}`)}` : ""
     );
+    const tunnelRuntimeGenerationCmd = () => {
+      const tokens = (hostTunnels as any[])
+        .map((tunnel: any) => {
+          const tunnelId = Number(tunnel?.id || 0);
+          const generation = getTunnelRuntimeGeneration(tunnelId);
+          return tunnelId > 0 && generation > 0 ? `${tunnelId}:${generation}` : "";
+        })
+        .filter(Boolean)
+        .sort()
+        .join(",");
+      return tokens ? `echo ${shQuote(`[runtime] tunnel generation ${tokens}`)}` : "";
+    };
     const tunnelEntryHostIdsByTunnelId = new Map<number, number[]>();
     await Promise.all((hostTunnels as any[]).map(async (tunnel: any) => {
       const entryHostIds = new Set<number>();
@@ -1011,6 +1044,7 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
         ? { mux: "true" }
         : undefined
     );
+    const tunnelDialerMetadata = (mode: string) => tunnelProtocolMetadata(mode);
     const proxyProtocolEnabled = (rule: any, direction: "receive" | "send" | "entryReceive" | "entrySend" | "exitReceive" | "exitSend") => {
       if (!isForwardRuleProtocolTcpEnabled(rule?.protocol)) return false;
       if (direction === "receive" || direction === "entryReceive") return !!(rule as any).proxyProtocolReceive;
@@ -1394,13 +1428,34 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
     };
     const ruleProtocolPolicy = (rule: any) => getHostProtocolPolicy(Number((rule as any)?.hostId || 0));
     const tunnelProtocolPolicy = (tunnel: any) => getHostProtocolPolicy(isCurrentHostTunnelEntry(tunnel) ? Number(host.id) : Number((tunnel as any)?.entryHostId || 0));
+    const processBackendForwardTypes = new Set(["gost", "realm", "socat", "nginx"]);
+    const shouldUseProcessBackendGuard = (rule: any) => processBackendForwardTypes.has(String(rule?.forwardType || ""));
     const shouldUseRuleGuard = async (rule: any) => {
       if (rule.forwardType === "gost" && Number((rule as any).tunnelId || 0) > 0) return false;
+      if (!shouldUseProcessBackendGuard(rule)) return false;
+      if (!isAgentVersionAtLeast(String((host as any).agentVersion || ""), AGENT_PROTOCOL_GUARD_BACKEND_VERSION)) return false;
       if (!isForwardRuleProtocolTcpEnabled(rule.protocol)) return false;
       return hasProtocolPolicy(await ruleProtocolPolicy(rule));
     };
     const shouldUseProtocolGuard = (rule: any, policy: any) => isForwardRuleProtocolTcpEnabled(rule?.protocol) && hasProtocolPolicy(policy);
     const guardListenPort = (rule: any) => 39000 + (Number(rule.id) % 20000);
+    const guardBackendPort = (rule: any) => 43000 + (Number(rule.id) % 20000);
+    const guardTargetForRule = (rule: any, useRuleGuard: boolean) => (
+      useRuleGuard && shouldUseProcessBackendGuard(rule)
+        ? { targetIp: "127.0.0.1", targetPort: guardBackendPort(rule), backendPort: guardBackendPort(rule), backendForwardType: String(rule.forwardType || "") }
+        : { ...failoverTargetEndpoint(rule), backendPort: 0, backendForwardType: "" }
+    );
+    const cleanupGuardBackendCmds = (rule: any) => {
+      const sourcePort = Number(rule?.sourcePort || 0);
+      if (!sourcePort) return [];
+      return [
+        removeManagedServiceCmd(`forwardx-realm-guard-${sourcePort}`),
+        removeManagedServiceCmd(`forwardx-socat-guard-${sourcePort}`),
+        removeManagedServiceCmd(`forwardx-socat-guard-tcp-${sourcePort}`),
+        removeManagedServiceCmd(`forwardx-socat-guard-udp-${sourcePort}`),
+        `rm -f ${shQuote(realmGuardConfigPathForPort(sourcePort))} ${shQuote(`${realmGuardConfigPathForPort(sourcePort)}.sha256`)} 2>/dev/null || true`,
+      ];
+    };
     const tunnelExitRules = agentAllRules
       .filter((r: any) => {
         if (r.pendingDelete || !r.isEnabled || r.forwardType !== "gost" || !r.tunnelId) return false;
@@ -1439,7 +1494,7 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
         : { type: "relay", metadata: { nodelay: true } },
       dialer: {
         type: dialerType,
-        ...(dialerType !== "tcp" && tunnelProtocolMetadata(tunnel.mode) ? { metadata: tunnelProtocolMetadata(tunnel.mode) } : {}),
+        ...(tunnelDialerMetadata(tunnel.mode) ? { metadata: tunnelDialerMetadata(tunnel.mode) } : {}),
       },
     });
     const buildLoadBalancedExitNodes = async (rule: any, tunnel: any, primaryHostOverride?: string) => {
@@ -1478,7 +1533,6 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
         if (tunnel && !isGostTunnelMode(tunnel)) return [];
         const protos = tunnel ? tunnelForwardProtos(r.protocol) : forwardRuleProtocols(r.protocol);
         return Promise.all(protos.map(async (proto) => {
-          if (useRuleGuard && proto === "tcp") return null;
           const tunnelHops = tunnel ? tunnelHopsByTunnelId.get(Number(tunnel.id)) : null;
           const firstHop = Array.isArray(tunnelHops) && tunnelHops.length >= 2 ? (tunnelHops[0] as any) : null;
           const isMultiHopTunnel = Array.isArray(tunnelHops) && tunnelHops.length >= 3;
@@ -1488,9 +1542,10 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
             && Number(firstHop.hostId) === Number(host.id);
           const tunnelExitHost = tunnel ? tunnelExitEndpointById.get(tunnel.id)?.host : "";
           const handlerProxyMetadata = proto === "tcp" && !tunnel ? maybeProxyProtocolMetadata(r, "send") : undefined;
+          const serviceListenPort = useRuleGuard && !tunnel ? guardBackendPort(r) : Number(r.sourcePort);
           const service: any = {
             name: `fwx-${r.id}-${proto}`,
-            addr: `:${r.sourcePort}`,
+            addr: useRuleGuard && !tunnel ? `127.0.0.1:${serviceListenPort}` : `:${serviceListenPort}`,
             handler: tunnel
               ? { type: proto, chain: `chain-tunnel-${r.id}` }
               : { type: proto, ...(handlerProxyMetadata ? { metadata: handlerProxyMetadata } : {}) },
@@ -1498,6 +1553,8 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
           };
           if (proto === "tcp" && proxyProtocolEnabled(r, "receive")) {
             service.metadata = maybeProxyProtocolMetadata(r, "receive");
+          } else if (proto === "tcp" && useRuleGuard && proxyProtocolEnabled(r, "send")) {
+            service.metadata = { proxyProtocol: proxyProtocolVersion(r) };
           }
           if (!tunnel) {
             service.forwarder = {
@@ -1889,23 +1946,73 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
       ...buildCountingCleanupCmds(rule.sourcePort, rule.targetIp, rule.targetPort, rule.protocol),
       ...buildAccessLimitCleanupCmds(rule.sourcePort, accessScopeForRule(rule)),
     ];
+    const nginxRuntimeActiveCmd = () => (
+      `if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then systemctl is-active --quiet ${shQuote(NGINX_SERVICE_NAME)}.service; ` +
+      `elif command -v rc-service >/dev/null 2>&1; then rc-service ${shQuote(NGINX_SERVICE_NAME)} status >/dev/null 2>&1; ` +
+      `elif [ -x /etc/init.d/${NGINX_SERVICE_NAME} ]; then /etc/init.d/${NGINX_SERVICE_NAME} status >/dev/null 2>&1; ` +
+      `else pgrep -f '${NGINX_BIN}.*${NGINX_CONFIG_PATH}' >/dev/null 2>&1; fi`
+    );
+    const nginxConfigHashCmd = (configPath = NGINX_CONFIG_PATH) => {
+      const config = shQuote(configPath);
+      return `if command -v sha256sum >/dev/null 2>&1; then sha256sum ${config} 2>/dev/null | awk '{print "sha256:"$1}'; elif command -v cksum >/dev/null 2>&1; then cksum ${config} 2>/dev/null | awk '{print "cksum:"$1":"$2}'; else echo "mtime:$(wc -c < ${config} 2>/dev/null):$(date -r ${config} +%s 2>/dev/null)"; fi`;
+    };
+    const nginxRuntimeVerifyCmd = () => {
+      const config = shQuote(NGINX_CONFIG_PATH);
+      return `[ -s ${config} ] && (${nginxRuntimeActiveCmd()}) && new_hash=$(${nginxConfigHashCmd()}); old_hash=$(cat ${config}.sha256 2>/dev/null || true); [ -n "$new_hash" ] && [ "$new_hash" = "$old_hash" ]`;
+    };
+    const deployNginxConfigCmd = (encodedConfig: string) => {
+      const staged = shQuote(NGINX_STAGED_CONFIG_PATH);
+      const live = shQuote(NGINX_CONFIG_PATH);
+      return [
+        `printf '%s' '${encodedConfig}' | base64 -d > ${staged}`,
+        `${shQuote(NGINX_BIN)} -p ${shQuote(NGINX_CONFIG_DIR)} -c ${staged} -t`,
+        `if cmp -s ${staged} ${live} 2>/dev/null; then rm -f ${staged}; else mv -f ${staged} ${live}; fi`,
+      ].join(" && ");
+    };
+    const reloadNginxIfConfigChangedCmd = () => {
+      const config = shQuote(NGINX_CONFIG_PATH);
+      const active = nginxRuntimeActiveCmd();
+      const start = startManagedServiceCmd(NGINX_SERVICE_NAME);
+      const configHash = nginxConfigHashCmd();
+      const reload = `${shQuote(NGINX_BIN)} -p ${shQuote(NGINX_CONFIG_DIR)} -c ${config} -s reload || { [ -s /run/forwardx-nginx.pid ] && kill -HUP "$(cat /run/forwardx-nginx.pid)" 2>/dev/null; }`;
+      return `new_hash=$(${configHash}); old_hash=$(cat ${config}.sha256 2>/dev/null || true); if [ -z "$new_hash" ]; then echo "[service] ${NGINX_SERVICE_NAME} config hash failed"; exit 1; fi; if [ "$new_hash" != "$old_hash" ] || ! { ${active}; }; then if { ${active}; }; then ${reload} || { echo "[service] ${NGINX_SERVICE_NAME} reload failed"; exit 1; }; else ${start}; fi; printf '%s' "$new_hash" > ${config}.sha256; else echo "[service] ${NGINX_SERVICE_NAME} config unchanged"; fi`;
+    };
     const buildNginxRuntimeSyncCmds = async () => {
+      const startedAt = Date.now();
       const upstreams: string[] = [];
       const servers: string[] = [];
       const certCmds: string[] = [];
       const certFingerprints: string[] = [];
       const certKeys = new Set<string>();
       const countingCmds: string[] = [];
+      const routeSummaries: string[] = [];
+      const warnNginxRoute = (message: string) => {
+        const key = `nginx:${Number(host.id)}:${message}`;
+        if (tunnelRouteLogCache.get(key) === message) return;
+        tunnelRouteLogCache.set(key, message);
+        appendPanelLog("warn", message);
+      };
+      const logNginxRoute = (message: string) => {
+        const key = `nginx:${Number(host.id)}:${message}`;
+        if (tunnelRouteLogCache.get(key) === message) return;
+        tunnelRouteLogCache.set(key, message);
+        appendPanelLog("info", message);
+      };
       const nginxTunnelCert = (tunnel: any) => {
         const id = Number(tunnel?.id || 0);
         const certPem = String(tunnel?.certPem || "").trim();
         const keyPem = String(tunnel?.certKeyPem || "").trim();
         if (!id || !certPem || !keyPem) return null;
+        const normalizedCertPem = certPem.endsWith("\n") ? certPem : `${certPem}\n`;
+        const normalizedKeyPem = keyPem.endsWith("\n") ? keyPem : `${keyPem}\n`;
+        const fingerprint = crypto.createHash("sha256").update(`${normalizedCertPem}\n${normalizedKeyPem}`).digest("hex");
+        const fileKey = fingerprint.slice(0, 16);
         return {
-          certPath: `${NGINX_CERT_DIR}/tunnel-${id}.crt`,
-          keyPath: `${NGINX_CERT_DIR}/tunnel-${id}.key`,
-          certPem: certPem.endsWith("\n") ? certPem : `${certPem}\n`,
-          keyPem: keyPem.endsWith("\n") ? keyPem : `${keyPem}\n`,
+          certPath: `${NGINX_CERT_DIR}/tunnel-${id}-${fileKey}.crt`,
+          keyPath: `${NGINX_CERT_DIR}/tunnel-${id}-${fileKey}.key`,
+          certPem: normalizedCertPem,
+          keyPem: normalizedKeyPem,
+          fingerprint,
           serverName: String(tunnel?.certDomain || "").trim() || null,
         };
       };
@@ -1915,7 +2022,7 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
         const key = `${cert.certPath}:${cert.keyPath}`;
         if (!certKeys.has(key)) {
           certKeys.add(key);
-          certFingerprints.push(`# cert tunnel-${Number(tunnel?.id || 0)} ${crypto.createHash("sha256").update(`${cert.certPem}\n${cert.keyPem}`).digest("hex")}`);
+          certFingerprints.push(`# cert tunnel-${Number(tunnel?.id || 0)} ${cert.fingerprint}`);
           certCmds.push(
             `printf '%s' '${Buffer.from(cert.certPem, "utf8").toString("base64")}' | base64 -d > ${shQuote(cert.certPath)}`,
             `printf '%s' '${Buffer.from(cert.keyPem, "utf8").toString("base64")}' | base64 -d > ${shQuote(cert.keyPath)}`,
@@ -1940,13 +2047,14 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
         if (!rule || rule.pendingDelete || !rule.isEnabled || rule.forwardType !== "nginx") continue;
         if (!isRuleProtocolEnabled(forwardProtocolSettings, rule, null)) continue;
         const useRuleGuard = await shouldUseRuleGuard(rule);
+        const listenPort = useRuleGuard ? guardBackendPort(rule) : Number(rule.sourcePort);
         for (const proto of nginxProtocolsForRule(rule)) {
-          if (useRuleGuard && proto === "tcp") continue;
           const upstream = `fwx_rule_${Number(rule.id)}_${proto}`;
           if (!addUpstreamServer(upstream, [{ addr: nginxEndpoint(processTarget(rule), rule.targetPort), primary: true }])) continue;
+          routeSummaries.push(`rule=${rule.id} port=${Number(rule.sourcePort)} listen=${listenPort} proto=${proto} target=${processTarget(rule)}:${Number(rule.targetPort) || 0}`);
           addServer({
             name: `rule ${Number(rule.id)} ${proto}`,
-            listenPort: Number(rule.sourcePort),
+            listenPort,
             proto,
             upstream,
           });
@@ -1967,9 +2075,17 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
             ? (tunnelExitEndpointById.get(tunnel.id)?.host || await tunnelExitHostAddress(tunnel))
             : await getExtraExitDialAddress(endpoint.node);
           const addr = nginxEndpoint(exitHost, endpoint.listenPort);
-          if (addr) endpoints.push({ addr, primary: endpoint.primary });
+          if (addr) {
+            endpoints.push({ addr, primary: endpoint.primary });
+            continue;
+          }
+          warnNginxRoute(`[NginxRuntime] missing endpoint host=${host.id} name=${String(host.name || "-")} tunnel=${tunnel.id} rule=${rule.id} exitHost=${endpoint.exitHostId} listenPort=${endpoint.listenPort || "-"} primary=${endpoint.primary}`);
         }
-        if (endpoints.length === 0) continue;
+        if (endpoints.length === 0) {
+          warnNginxRoute(`[NginxRuntime] skipped tunnel entry host=${host.id} name=${String(host.name || "-")} tunnel=${tunnel.id} rule=${rule.id} reason=no-endpoints`);
+          continue;
+        }
+        routeSummaries.push(`entry rule=${rule.id} tunnel=${tunnel.id} port=${Number(rule.sourcePort)} endpoints=${endpoints.map((item) => item.addr).join(",")}`);
         for (const proto of nginxProtocolsForRule(rule)) {
           const upstream = `fwx_tentry_${Number(rule.id)}_${proto}`;
           if (!addUpstreamServer(upstream, endpoints, (tunnel as any).loadBalanceStrategy)) continue;
@@ -1992,6 +2108,7 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
         const cert = ensureNginxTunnelCert(tunnel);
         for (const exitPort of currentHostTunnelExitPortsForRule(rule, tunnel)) {
           nginxBusinessListenKeys.add(`${Number(host.id)}:${Number(exitPort)}`);
+          routeSummaries.push(`exit rule=${rule.id} tunnel=${tunnel.id} host=${Number(host.id)} listen=${Number(exitPort)} target=${processTarget(rule)}:${Number(rule.targetPort) || 0}`);
           for (const proto of nginxProtocolsForRule(rule)) {
             const upstream = `fwx_texit_${Number(tunnel.id)}_${Number(rule.id)}_${Number(exitPort)}_${proto}`;
             if (!addUpstreamServer(upstream, [{ addr: nginxEndpoint(processTarget(rule), rule.targetPort), primary: true }])) continue;
@@ -2030,6 +2147,20 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
       }
 
       const hasServers = servers.length > 0;
+      const configSignature = crypto.createHash("sha256")
+        .update(JSON.stringify({ hostId: Number(host.id), upstreams, servers, certFingerprints, counting: countingCmds.length }))
+        .digest("hex");
+      const previousSignature = nginxRuntimeLogCache.get(Number(host.id));
+      if (previousSignature !== configSignature) {
+        nginxRuntimeLogCache.set(Number(host.id), configSignature);
+        logNginxRoute(`[NginxRuntime] host=${host.id} name=${String(host.name || "-")} servers=${servers.length} upstreams=${upstreams.length} certs=${certKeys.size} counting=${countingCmds.length} routes=${routeSummaries.length} elapsedMs=${Date.now() - startedAt}`);
+        for (const summary of routeSummaries.slice(0, 20)) {
+          logNginxRoute(`[NginxRuntime] host=${host.id} ${summary}`);
+        }
+        if (routeSummaries.length > 20) {
+          logNginxRoute(`[NginxRuntime] host=${host.id} routeDetailsOmitted=${routeSummaries.length - 20}`);
+        }
+      }
       const config = [
         `include ${NGINX_CONFIG_DIR}/modules.conf;`,
         "worker_processes auto;",
@@ -2055,15 +2186,12 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
       const encodedConfig = Buffer.from(config, "utf8").toString("base64");
       const cmds = [
         `mkdir -p ${shQuote(NGINX_CONFIG_DIR)} ${shQuote(NGINX_CERT_DIR)} /var/log/forwardx-agent`,
-        `find ${shQuote(NGINX_CERT_DIR)} -maxdepth 1 -type f \\( -name 'tunnel-*.crt' -o -name 'tunnel-*.key' \\) -delete 2>/dev/null || true`,
         ...certCmds,
         `modules_conf=${shQuote(`${NGINX_CONFIG_DIR}/modules.conf`)}; : > "$modules_conf"; for mod in /usr/lib/nginx/modules/ngx_stream_module.so /usr/lib64/nginx/modules/ngx_stream_module.so /usr/share/nginx/modules/ngx_stream_module.so modules/ngx_stream_module.so; do if [ -s "$mod" ]; then printf 'load_module %s;\\n' "$mod" > "$modules_conf"; break; fi; done`,
-        `printf '%s' '${encodedConfig}' | base64 -d > ${shQuote(NGINX_CONFIG_PATH)}`,
       ];
       if (hasServers) {
-        cmds.unshift(ensureNginxBinaryCmd());
-        cmds.push(
-          `${NGINX_BIN} -p ${NGINX_CONFIG_DIR} -c ${NGINX_CONFIG_PATH} -t`,
+        const nginxApplyCmd = [
+          deployNginxConfigCmd(encodedConfig),
           writeManagedServiceCmd(NGINX_SERVICE_NAME, [
             "[Unit]",
             "Description=ForwardX managed Nginx stream runtime",
@@ -2072,6 +2200,7 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
             "[Service]",
             "Type=simple",
             `ExecStart=${NGINX_BIN} -p ${NGINX_CONFIG_DIR} -c ${NGINX_CONFIG_PATH} -g "daemon off;"`,
+            `ExecReload=${NGINX_BIN} -p ${NGINX_CONFIG_DIR} -c ${NGINX_CONFIG_PATH} -s reload`,
             "Restart=always",
             "RestartSec=5",
             "LimitNOFILE=65535",
@@ -2081,21 +2210,35 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
             "",
           ].join("\n")),
           ...(anyTunnelDnsRefresh(hostTunnels as any[]) ? [dnsRuntimeRefreshCmd("nginx"), `rm -f ${shQuote(`${NGINX_CONFIG_PATH}.sha256`)} 2>/dev/null || true`] : []),
-          restartManagedServiceIfConfigChangedCmd(NGINX_SERVICE_NAME, NGINX_CONFIG_PATH),
-        );
+          reloadNginxIfConfigChangedCmd(),
+        ].filter(Boolean).map((cmd) => `(${cmd})`).join(" && ");
+        cmds.unshift(ensureNginxBinaryCmd());
+        cmds.push(nginxApplyCmd);
       } else {
-        cmds.push(stopManagedServiceCmd(NGINX_SERVICE_NAME), `rm -f ${shQuote(`${NGINX_CONFIG_PATH}.sha256`)} 2>/dev/null || true`);
+        cmds.push(
+          `rm -f ${shQuote(NGINX_STAGED_CONFIG_PATH)} 2>/dev/null || true`,
+          stopManagedServiceCmd(NGINX_SERVICE_NAME),
+          `rm -f ${shQuote(`${NGINX_CONFIG_PATH}.sha256`)} 2>/dev/null || true`,
+        );
       }
       cmds.push(...countingCmds);
       return cmds;
     };
+    let nginxRuntimeSyncCmdsPromise: Promise<string[]> | null = null;
+    const getNginxRuntimeSyncCmds = () => {
+      if (!nginxRuntimeSyncCmdsPromise) {
+        nginxRuntimeSyncCmdsPromise = buildNginxRuntimeSyncCmds();
+      }
+      return nginxRuntimeSyncCmdsPromise;
+    };
 
     const buildGostRuntimeSyncCmds = async () => [
+      tunnelRuntimeGenerationCmd(),
       ...buildGostReloadCmds(),
       ...await buildTunnelReloadCmds(),
-      ...await buildNginxRuntimeSyncCmds(),
+      ...await getNginxRuntimeSyncCmds(),
       ...buildMimicRuntimeSyncCmds(),
-    ];
+    ].filter(Boolean);
 
     const ruleTrafficPort = (rule: any) => {
       const tunnel = rule.tunnelId ? tunnelById.get(rule.tunnelId) as any : null;
@@ -2166,6 +2309,7 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
             removeManagedServiceCmd(svcName),
             killByPatternCmd(`[r]ealm .*${realmConfigPath}`),
             `rm -f ${shQuote(realmConfigPath)} ${shQuote(`${realmConfigPath}.sha256`)} 2>/dev/null || true`,
+            ...cleanupGuardBackendCmds(rule),
             `rm -f /var/lib/forwardx-agent/traffic_${rule.sourcePort}.prev 2>/dev/null || true`,
             `rm -f /var/lib/forwardx-agent/port_${rule.sourcePort}.rule 2>/dev/null || true`,
             ...buildCountingCleanupCmds(rule.sourcePort, rule.targetIp, rule.targetPort, rule.protocol),
@@ -2185,6 +2329,7 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
           removeCmds.push(removeManagedServiceCmd(svcName));
         }
         removeCmds.push(killByPatternCmd(`[s]ocat.*LISTEN:${rule.sourcePort}`));
+        removeCmds.push(...cleanupGuardBackendCmds(rule));
         removeCmds.push(`rm -f /var/lib/forwardx-agent/traffic_${rule.sourcePort}.prev 2>/dev/null || true`);
         removeCmds.push(`rm -f /var/lib/forwardx-agent/port_${rule.sourcePort}.rule 2>/dev/null || true`);
         removeCmds.push(...buildCountingCleanupCmds(rule.sourcePort, rule.targetIp, rule.targetPort, rule.protocol));
@@ -2210,8 +2355,8 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
           targetPort: rule.targetPort,
           protocol: rule.protocol,
           commands: [
-            ...(await buildNginxRuntimeSyncCmds()),
             ...buildNginxPortCleanupCmds(rule),
+            ...cleanupGuardBackendCmds(rule),
           ],
         };
       }
@@ -2228,8 +2373,8 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
             targetPort: rule.targetPort,
             protocol: rule.protocol,
             commands: [
-              ...(await buildNginxRuntimeSyncCmds()),
               ...buildNginxPortCleanupCmds(rule),
+              ...cleanupGuardBackendCmds(rule),
             ],
           };
         }
@@ -2247,6 +2392,7 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
           commands: [
             ...buildGostReloadCmds(),
             ...buildManagedPortCleanupCmds(rule.sourcePort, rule.targetIp, rule.targetPort, rule.protocol),
+            ...cleanupGuardBackendCmds(rule),
           ],
           fxp: tunnel && isForwardXTunnel(tunnel) ? {
             role: "entry",
@@ -2449,16 +2595,21 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
         const trafficPort = ruleTrafficPort(rule);
         if (!trafficPort) continue;
         if (useRuleGuard) {
-          const guardTarget = failoverTargetEndpoint(rule);
+          const guardTarget = guardTargetForRule(rule, useRuleGuard);
           guardRules.push({
             ruleId: rule.id,
             tunnelId: 0,
             listenPort: Number(rule.sourcePort),
             targetIp: guardTarget.targetIp,
             targetPort: guardTarget.targetPort,
+            backendPort: guardTarget.backendPort,
+            backendForwardType: guardTarget.backendForwardType,
+            protocol: normalizeForwardRuleProtocol(rule.protocol),
             policy: ruleGuardPolicy,
             proxyProtocolReceive: proxyProtocolEnabled(rule, "receive"),
-            proxyProtocolSend: proxyProtocolEnabled(rule, "send"),
+            proxyProtocolSend: guardTarget.backendPort > 0
+              ? (proxyProtocolEnabled(rule, "send") || proxyProtocolEnabled(rule, "receive"))
+              : proxyProtocolEnabled(rule, "send"),
             proxyProtocolVersion: proxyProtocolVersion(rule),
           });
         }
@@ -2480,7 +2631,13 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
 
       const ruleTunnelHops = ruleTunnel ? tunnelHopsByTunnelId.get(Number(ruleTunnel.id)) : null;
       const isCurrentTunnelEntryRule = !!ruleTunnel && isCurrentHostTunnelEntry(ruleTunnel);
+      const isGostMultiHopRule = !!ruleTunnel
+        && isGostTunnelMode(ruleTunnel)
+        && Array.isArray(ruleTunnelHops)
+        && ruleTunnelHops.length >= 3
+        && ruleTunnelHops.some((hop: any) => Number(hop.hostId) === Number(host.id));
       const shouldRefreshTunnelEntryRule = isCurrentTunnelEntryRule
+        && (isForwardXTunnel(ruleTunnel) || isGostMultiHopRule)
         && !isTunnelRuntimeHostReady(Number(ruleTunnel.id), Number(host.id));
       const isForwardXMultiHopRule = !!ruleTunnel
         && isForwardXTunnel(ruleTunnel)
@@ -2493,10 +2650,13 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
         && isForwardXTunnel(ruleTunnel)
         && isCurrentTunnelEntryRule;
       const shouldRefreshForwardXEntryRule = isForwardXEntryRule && shouldRefreshTunnelEntryRule;
-      if (rule.isEnabled && (!rule.isRunning || shouldRefreshTunnelEntryRule || shouldRefreshForwardXMultiHopRule)) {
+      const shouldRefreshGuardBackend = useRuleGuard
+        && shouldUseProcessBackendGuard(rule)
+        && !rule.isRunning;
+      if (rule.isEnabled && (!rule.isRunning || shouldRefreshTunnelEntryRule || shouldRefreshForwardXMultiHopRule || shouldRefreshGuardBackend)) {
         const cmds: string[] = [];
         if (useRuleGuard) {
-          const guardTarget = failoverTargetEndpoint(rule);
+          const guardTarget = guardTargetForRule(rule, useRuleGuard);
           const guardFailover = failoverForCurrentHost(rule, ruleTunnel, { listenPort: failoverProxyPort(rule) });
           guardRules.push({
             ruleId: rule.id,
@@ -2504,33 +2664,168 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
             listenPort: Number(rule.sourcePort),
             targetIp: guardTarget.targetIp,
             targetPort: guardTarget.targetPort,
+            backendPort: guardTarget.backendPort,
+            backendForwardType: guardTarget.backendForwardType,
+            protocol: normalizeForwardRuleProtocol(rule.protocol),
             policy: ruleGuardPolicy,
             proxyProtocolReceive: proxyProtocolEnabled(rule, "receive"),
-            proxyProtocolSend: proxyProtocolEnabled(rule, "send"),
+            proxyProtocolSend: guardTarget.backendPort > 0
+              ? (proxyProtocolEnabled(rule, "send") || proxyProtocolEnabled(rule, "receive"))
+              : proxyProtocolEnabled(rule, "send"),
             proxyProtocolVersion: proxyProtocolVersion(rule),
           });
-          actions.push({
+          const guardCleanupCmds = [
+            ...buildManagedPortCleanupCmds(rule.sourcePort, rule.targetIp, rule.targetPort, rule.protocol),
+            ...buildIptablesForwardCleanupCmds(rule),
+            ...buildNftCleanupCmds(rule),
+            ...cleanupGuardBackendCmds(rule),
+          ];
+          const guardCountingCmds = [
+            ...buildCountingChainCmds(rule.sourcePort, rule.targetIp, rule.targetPort, rule.protocol),
+            ...buildRuleAccessLimitCmds(rule),
+          ];
+          const guardAction: any = {
             ruleId: rule.id,
             op: "apply",
             forwardType: "guard",
             sourcePort: rule.sourcePort,
-            targetIp: guardTarget.targetIp,
-            targetPort: guardTarget.targetPort,
-            protocol: "tcp",
-            commands: [
-              ...buildManagedPortCleanupCmds(rule.sourcePort, rule.targetIp, rule.targetPort, rule.protocol),
-              ...buildIptablesForwardCleanupCmds(rule),
-              ...buildNftCleanupCmds(rule),
+            targetIp: rule.targetIp,
+            targetPort: rule.targetPort,
+            protocol: normalizeForwardRuleProtocol(rule.protocol),
+            networkInterface: hostInterface,
+          };
+          if (guardTarget.backendPort > 0 && rule.forwardType === "realm") {
+            const svcName = `forwardx-realm-guard-${rule.sourcePort}`;
+            const realmConfigPath = realmGuardConfigPathForPort(rule.sourcePort);
+            const realmRemote = endpointHostPort(processTarget(rule), rule.targetPort);
+            const realmConfig = [
+              "[log]",
+              'level = "warn"',
+              "",
+              "[network]",
+              `use_udp = ${isForwardRuleProtocolUdpEnabled(rule.protocol) ? "true" : "false"}`,
+              `zero_copy = ${(rule as any).zeroCopy && isForwardRuleProtocolTcpEnabled(rule.protocol) ? "true" : "false"}`,
+              `fast_open = ${(rule as any).tcpFastOpen && isForwardRuleProtocolTcpEnabled(rule.protocol) ? "true" : "false"}`,
+              "tcp_timeout = 300",
+              "udp_timeout = 30",
+              "ipv6_only = false",
+              `send_proxy = ${proxyProtocolEnabled(rule, "send") ? "true" : "false"}`,
+              `send_proxy_version = ${proxyProtocolVersion(rule)}`,
+              `accept_proxy = ${(proxyProtocolEnabled(rule, "send") || proxyProtocolEnabled(rule, "receive")) ? "true" : "false"}`,
+              "accept_proxy_timeout = 5",
+              "",
+              "[[endpoints]]",
+              `listen = ${realmTomlString(`127.0.0.1:${guardTarget.backendPort}`)}`,
+              `remote = ${realmTomlString(realmRemote)}`,
+              "",
+            ].join("\n");
+            const realmConfigB64 = Buffer.from(realmConfig, "utf8").toString("base64");
+            const ifaceFlag = hostInterface ? ` --interface ${hostInterface}` : "";
+            const realmCmd = `/usr/local/bin/realm -c ${realmConfigPath}${ifaceFlag}`;
+            guardAction.svcName = svcName;
+            guardAction.unit = [
+              "[Unit]",
+              `Description=ForwardX guarded realm backend ${rule.sourcePort}->${rule.targetIp}:${rule.targetPort}`,
+              "After=network.target",
+              "",
+              "[Service]",
+              "Type=simple",
+              `ExecStart=${realmCmd}`,
+              "Restart=always",
+              "RestartSec=5",
+              "LimitNOFILE=65535",
+              "",
+              "[Install]",
+              "WantedBy=multi-user.target",
+              "",
+            ].join("\n");
+            guardAction.preCommands = [
+              ...guardCleanupCmds,
               ...buildGostReloadCmds(),
-              ...buildCountingChainCmds(rule.sourcePort, rule.targetIp, rule.targetPort, "tcp"),
-            ],
-          });
+              `mkdir -p ${shQuote(REALM_CONFIG_DIR)}`,
+              `printf '%s' '${realmConfigB64}' | base64 -d > ${shQuote(realmConfigPath)}`,
+            ];
+            guardAction.commands = guardCountingCmds;
+          } else if (guardTarget.backendPort > 0 && rule.forwardType === "socat") {
+            const socatPreCmds: string[] = [
+              ...guardCleanupCmds,
+              ...buildGostReloadCmds(),
+              `command -v socat >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq socat || yum install -y -q socat || dnf install -y -q socat || zypper -n install socat || apk add --no-cache socat || pacman -Sy --noconfirm socat; } 2>/dev/null`,
+            ];
+            if (normalizeForwardRuleProtocol(rule.protocol) === "both") {
+              const svcNameTcp = `forwardx-socat-guard-tcp-${rule.sourcePort}`;
+              const svcNameUdp = `forwardx-socat-guard-udp-${rule.sourcePort}`;
+              guardAction.svcName = svcNameTcp;
+              guardAction.svcNameExtra = svcNameUdp;
+              guardAction.unit = [
+                "[Unit]",
+                `Description=ForwardX guarded socat TCP backend ${rule.sourcePort}->${rule.targetIp}:${rule.targetPort}`,
+                "After=network.target",
+                "",
+                "[Service]",
+                "Type=simple",
+                `ExecStart=/usr/bin/socat TCP4-LISTEN:${guardTarget.backendPort},fork,reuseaddr,bind=127.0.0.1 ${socatDialEndpoint("TCP", processTarget(rule), rule.targetPort)}`,
+                "Restart=always",
+                "RestartSec=5",
+                "LimitNOFILE=65535",
+                "",
+                "[Install]",
+                "WantedBy=multi-user.target",
+                "",
+              ].join("\n");
+              guardAction.unitExtra = [
+                "[Unit]",
+                `Description=ForwardX guarded socat UDP backend ${rule.sourcePort}->${rule.targetIp}:${rule.targetPort}`,
+                "After=network.target",
+                "",
+                "[Service]",
+                "Type=simple",
+                `ExecStart=/usr/bin/socat UDP4-LISTEN:${guardTarget.backendPort},fork,reuseaddr,bind=127.0.0.1 ${socatDialEndpoint("UDP", processTarget(rule), rule.targetPort)}`,
+                "Restart=always",
+                "RestartSec=5",
+                "LimitNOFILE=65535",
+                "",
+                "[Install]",
+                "WantedBy=multi-user.target",
+                "",
+              ].join("\n");
+            } else {
+              const protoUpper = normalizeForwardRuleProtocol(rule.protocol) === "udp" ? "UDP" : "TCP";
+              const listenProto = protoUpper === "UDP" ? "UDP4" : "TCP4";
+              guardAction.svcName = `forwardx-socat-guard-${rule.sourcePort}`;
+              guardAction.unit = [
+                "[Unit]",
+                `Description=ForwardX guarded socat ${rule.protocol} backend ${rule.sourcePort}->${rule.targetIp}:${rule.targetPort}`,
+                "After=network.target",
+                "",
+                "[Service]",
+                "Type=simple",
+                `ExecStart=/usr/bin/socat ${listenProto}-LISTEN:${guardTarget.backendPort},fork,reuseaddr,bind=127.0.0.1 ${socatDialEndpoint(protoUpper, processTarget(rule), rule.targetPort)}`,
+                "Restart=always",
+                "RestartSec=5",
+                "LimitNOFILE=65535",
+                "",
+                "[Install]",
+                "WantedBy=multi-user.target",
+                "",
+              ].join("\n");
+            }
+            guardAction.preCommands = socatPreCmds;
+            guardAction.commands = guardCountingCmds;
+          } else {
+            guardAction.commands = [
+              ...guardCleanupCmds,
+              ...(rule.forwardType === "nginx" ? [nginxRuntimeVerifyCmd()] : buildGostReloadCmds()),
+              ...guardCountingCmds,
+            ];
+          }
+          actions.push(guardAction);
           addRunningRule({
             ruleId: rule.id,
             sourcePort: Number(rule.sourcePort),
             targetIp: rule.targetIp,
             targetPort: rule.targetPort,
-            protocol: "tcp",
+            protocol: normalizeForwardRuleProtocol(rule.protocol),
             forwardType: "guard",
             failover: guardFailover,
           });
@@ -2619,6 +2914,7 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
             svcName,
             unit,
             preCommands: [
+              ...cleanupGuardBackendCmds(rule),
               `mkdir -p ${shQuote(REALM_CONFIG_DIR)}`,
               `printf '%s' '${realmConfigB64}' | base64 -d > ${shQuote(realmConfigPath)}`,
             ],
@@ -2633,6 +2929,7 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
           // socat 转发：用户态进程，通过 systemd 管理
           const svcName = `forwardx-socat-${rule.sourcePort}`;
           const socatPreCmds: string[] = [
+            ...cleanupGuardBackendCmds(rule),
             ...buildGostReloadCmds(),
             `command -v socat >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq socat || yum install -y -q socat || dnf install -y -q socat || zypper -n install socat || apk add --no-cache socat || pacman -Sy --noconfirm socat; } 2>/dev/null`,
           ];
@@ -2748,7 +3045,8 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
             protocol: rule.protocol,
             networkInterface: hostInterface,
             commands: [
-              ...(await buildNginxRuntimeSyncCmds()),
+              ...cleanupGuardBackendCmds(rule),
+              nginxRuntimeVerifyCmd(),
             ],
           });
         } else if (rule.forwardType === "gost") {
@@ -2765,7 +3063,7 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
               targetPort: rule.targetPort,
               protocol: rule.protocol,
               networkInterface: hostInterface,
-              commands: await buildNginxRuntimeSyncCmds(),
+              commands: [nginxRuntimeVerifyCmd()],
             });
             continue;
           }
@@ -2838,6 +3136,7 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
             protocol: rule.protocol,
             networkInterface: hostInterface,
             commands: [
+              ...cleanupGuardBackendCmds(rule),
               ...buildGostReloadCmds(),
               ...buildCountingChainCmds(rule.sourcePort, rule.targetIp, rule.targetPort, rule.protocol),
               ...buildRuleAccessLimitCmds(rule),
@@ -2880,6 +3179,7 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
             commands: [
               removeManagedServiceCmd(svcName),
               killByPatternCmd(`[r]ealm .*${realmConfigPath}`),
+              ...cleanupGuardBackendCmds(rule),
               `rm -f ${shQuote(realmConfigPath)} ${shQuote(`${realmConfigPath}.sha256`)} 2>/dev/null || true`,
               // 清理 conntrack 流量状态文件
               `rm -f /var/lib/forwardx-agent/traffic_${rule.sourcePort}.prev 2>/dev/null || true`,
@@ -2900,6 +3200,7 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
             removeCmds.push(removeManagedServiceCmd(svcName));
           }
           removeCmds.push(killByPatternCmd(`[s]ocat.*LISTEN:${rule.sourcePort}`));
+          removeCmds.push(...cleanupGuardBackendCmds(rule));
           // 清理 conntrack 流量状态文件
           removeCmds.push(`rm -f /var/lib/forwardx-agent/traffic_${rule.sourcePort}.prev 2>/dev/null || true`);
           removeCmds.push(`rm -f /var/lib/forwardx-agent/port_${rule.sourcePort}.rule 2>/dev/null || true`);
@@ -2925,7 +3226,6 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
             targetPort: rule.targetPort,
             protocol: rule.protocol,
             commands: [
-              ...(await buildNginxRuntimeSyncCmds()),
               ...buildNginxPortCleanupCmds(rule),
             ],
           });
@@ -2943,8 +3243,8 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
               targetPort: rule.targetPort,
               protocol: rule.protocol,
               commands: [
-                ...(await buildNginxRuntimeSyncCmds()),
                 ...buildNginxPortCleanupCmds(rule),
+                ...cleanupGuardBackendCmds(rule),
               ],
             });
             continue;
@@ -2955,6 +3255,7 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
           const removeCmds: string[] = [
             ...buildGostReloadCmds(),
             ...buildManagedPortCleanupCmds(rule.sourcePort, rule.targetIp, rule.targetPort, rule.protocol),
+            ...cleanupGuardBackendCmds(rule),
           ];
           actions.push({
             ruleId: rule.id,
@@ -2990,6 +3291,7 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
           listenPort: guardListenPort(rule),
           targetIp: target.targetIp,
           targetPort: target.targetPort,
+          protocol: normalizeForwardRuleProtocol(rule.protocol),
           policy,
           proxyProtocolReceive: proxyProtocolEnabled(rule, "exitReceive"),
           proxyProtocolSend: proxyProtocolEnabled(rule, "exitSend"),
@@ -3009,6 +3311,7 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
           listenPort: guardListenPort(rule),
           targetIp: target.targetIp,
           targetPort: target.targetPort,
+          protocol: normalizeForwardRuleProtocol(rule.protocol),
           policy,
           proxyProtocolReceive: false,
           proxyProtocolSend: false,
@@ -3297,7 +3600,7 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
     const nextInterval = hasInteractiveTasks ? 2 : Math.min(isHostMetricsWatching(host.id) ? 3 : 30, serviceProbeInterval);
     res.json({ success: true, actions: orderedActions, selfTests, runningRules, tunnelProbes, forwardGroupProbes, hostProbeServices, guardRules, dnsWatch: Array.from(dnsWatches.values()), lookingGlassTests, iperf3Tasks, agentUpgrade, panelUrl, forceTcping, nextInterval });
   } catch (error) {
-    console.error("[Agent Heartbeat] Error:", error);
+    console.error(`[Agent Heartbeat] Error host=${logHostId || "-"} name=${logHostName || "-"}:`, error);
     res.status(500).json({ error: "Internal server error" });
   }
 });

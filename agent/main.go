@@ -34,7 +34,7 @@ import (
 	"time"
 )
 
-var Version = "2.2.125"
+var Version = "2.2.129"
 
 const selfUpgradeLockTimeout = 10 * time.Minute
 const iperf3IdleTimeout = 3 * time.Minute
@@ -47,6 +47,10 @@ const trafficCollectInterval = 3 * time.Second
 const countingChainRefreshInterval = 6 * time.Hour
 const runtimeActionRefreshInterval = 5 * time.Minute
 const agentLogRetention = 72 * time.Hour
+const agentLogMaxBytes int64 = 8 * 1024 * 1024
+const agentLogTailBytes int64 = 4 * 1024 * 1024
+const agentMemoryCacheRetention = 24 * time.Hour
+const agentReportLogMaxKeys = 2048
 const agentSlowRequestThreshold = 1500 * time.Millisecond
 const agentReportLogInterval = 30 * time.Second
 const actionBacklogHeartbeatDelay = 30 * time.Second
@@ -58,6 +62,7 @@ const protocolGuardConfirmations = 3
 const protocolGuardWindowStep = 64
 const protocolGuardTLSMinRecordSize = 64
 const protocolGuardSOCKS5MaxMethods = 16
+const protocolGuardUDPIdleTimeout = 2 * time.Minute
 const agentVerboseEnv = "FORWARDX_AGENT_VERBOSE_LOG"
 
 const agentLogDir = "/var/log/forwardx-agent"
@@ -115,6 +120,7 @@ var runtimeProxyLogSignatures = map[string]string{}
 var dnsWatchHostPattern = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9\-_.]*[A-Za-z0-9])?$`)
 var agentReportLogMu sync.Mutex
 var agentReportLogAt = map[string]time.Time{}
+var agentMemoryPrunedAt time.Time
 var actionPendingCount int64
 var heartbeatWakeCh = make(chan struct{}, 1)
 var agentVerboseLogs = isEnvTruthy(os.Getenv(agentVerboseEnv))
@@ -259,11 +265,11 @@ type dnsWatchItem struct {
 }
 
 type dnsChangeReport struct {
-	Host string   `json:"host"`
-	Scope string  `json:"scope,omitempty"`
-	RefID int     `json:"refId,omitempty"`
-	Old  []string `json:"old,omitempty"`
-	New  []string `json:"new,omitempty"`
+	Host  string   `json:"host"`
+	Scope string   `json:"scope,omitempty"`
+	RefID int      `json:"refId,omitempty"`
+	Old   []string `json:"old,omitempty"`
+	New   []string `json:"new,omitempty"`
 }
 
 type agentUpgrade struct {
@@ -422,6 +428,9 @@ type guardRule struct {
 	ListenPort           int            `json:"listenPort"`
 	TargetIP             string         `json:"targetIp"`
 	TargetPort           int            `json:"targetPort"`
+	BackendPort          int            `json:"backendPort"`
+	BackendForwardType   string         `json:"backendForwardType"`
+	Protocol             string         `json:"protocol"`
 	Policy               protocolPolicy `json:"policy"`
 	ProxyProtocolReceive bool           `json:"proxyProtocolReceive"`
 	ProxyProtocolSend    bool           `json:"proxyProtocolSend"`
@@ -671,6 +680,7 @@ func register(cfg Config) error {
 }
 
 func heartbeat(cfg Config) (int, error) {
+	pruneAgentRuntimeData()
 	ipv4, ipv6 := publicIPs()
 	primaryIP := ipv4
 	if primaryIP == "" {
@@ -1710,6 +1720,7 @@ func cleanupStaleRuntimeBeforeApply(a action) bool {
 		return false
 	}
 	port := strconv.Itoa(a.SourcePort)
+	sharedNginxRuntimePort := actionPortOwnedBySharedNginx(a)
 	if a.StatusType == "tunnel" && a.TunnelID > 0 {
 		localTunnelID := readTunnelIDByPort(port)
 		localForwardType := readTunnelForwardTypeByPort(port)
@@ -1720,10 +1731,14 @@ func cleanupStaleRuntimeBeforeApply(a action) bool {
 			}
 			if actionUsesManagedListener(a) {
 				cleanupUnknownManagedListener(port, a.SourcePort, a.ForwardType)
-				waitForActionListenPortFree(a, 2*time.Second)
+				if !sharedNginxRuntimePort {
+					waitForActionListenPortFree(a, 2*time.Second)
+				}
 			}
 			cleanupGostRuntimeIfPortBusy(a.SourcePort)
-			waitForActionListenPortFree(a, 2*time.Second)
+			if !sharedNginxRuntimePort {
+				waitForActionListenPortFree(a, 2*time.Second)
+			}
 			return false
 		}
 		if localTunnelID == a.TunnelID && (localForwardType == "" || localForwardType == a.ForwardType) {
@@ -1747,10 +1762,12 @@ func cleanupStaleRuntimeBeforeApply(a action) bool {
 		if a.Fxp != nil {
 			stopFXPByListenPort(a.SourcePort)
 		}
-		for _, cmd := range managedPortCleanupCmds(port) {
+		for _, cmd := range managedPortCleanupCmdsForApply(port, sharedNginxRuntimePort) {
 			_ = runShell(cmd)
 		}
-		waitForActionListenPortFree(a, 2*time.Second)
+		if !sharedNginxRuntimePort {
+			waitForActionListenPortFree(a, 2*time.Second)
+		}
 		removeTunnelStateByPort(port)
 		return false
 	}
@@ -1766,10 +1783,14 @@ func cleanupStaleRuntimeBeforeApply(a action) bool {
 		}
 		if actionUsesManagedListener(a) {
 			cleanupUnknownManagedListener(port, a.SourcePort, a.ForwardType)
-			waitForActionListenPortFree(a, 2*time.Second)
+			if !sharedNginxRuntimePort {
+				waitForActionListenPortFree(a, 2*time.Second)
+			}
 		}
 		cleanupGostRuntimeIfPortBusy(a.SourcePort)
-		waitForActionListenPortFree(a, 2*time.Second)
+		if !sharedNginxRuntimePort {
+			waitForActionListenPortFree(a, 2*time.Second)
+		}
 		return false
 	}
 	if localRuleID == a.RuleID && (localForwardType == "" || localForwardType == a.ForwardType) {
@@ -1799,11 +1820,33 @@ func cleanupStaleRuntimeBeforeApply(a action) bool {
 	if localForwardType == "nftables" && localRuleID > 0 {
 		_ = runShell(nftRuleCleanupCmd(localRuleID))
 	}
-	for _, cmd := range managedPortCleanupCmds(port) {
+	for _, cmd := range managedPortCleanupCmdsForApply(port, sharedNginxRuntimePort) {
 		_ = runShell(cmd)
 	}
-	waitForActionListenPortFree(a, 2*time.Second)
+	if !sharedNginxRuntimePort {
+		waitForActionListenPortFree(a, 2*time.Second)
+	}
 	return false
+}
+
+func actionUsesSharedNginxRuntime(a action) bool {
+	switch strings.TrimSpace(a.ForwardType) {
+	case "nginx", "nginx-tunnel", "nginx-tunnel-exit":
+		return true
+	default:
+		return false
+	}
+}
+
+func actionPortOwnedBySharedNginx(a action) bool {
+	return actionUsesSharedNginxRuntime(a) && a.SourcePort > 0 && nginxRuntimeConfigUsesPort(nginxConfigPath, a.SourcePort)
+}
+
+func managedPortCleanupCmdsForApply(port string, keepSharedNginx bool) []string {
+	if keepSharedNginx {
+		return managedPortCleanupCmdsWithNginx(port, false)
+	}
+	return managedPortCleanupCmds(port)
 }
 
 func actionUsesManagedListener(a action) bool {
@@ -1838,6 +1881,11 @@ func cleanupGostRuntimeIfPortBusy(port int) {
 	stopped := false
 	for _, item := range managedRuntimeConfigs() {
 		if managedRuntimeConfigUsesPort(item.path, port) {
+			if item.service == nginxServiceName {
+				logf("runtime cleanup keeps shared %s for busy port=%d; waiting for nginx runtime sync to reload config", item.service, port)
+				stopped = true
+				continue
+			}
 			logf("runtime cleanup stopping %s for busy port=%d: %v", item.service, port, err)
 			cleanupManagedService(item.service)
 			stopped = true
@@ -2478,6 +2526,10 @@ func iptablesAgentBinaryForTarget(targetIP string) string {
 	return "iptables"
 }
 
+func iptablesAgentIsIPAddress(value string) bool {
+	return net.ParseIP(iptablesAgentAddress(value)) != nil
+}
+
 func iptablesAgentCommand(binary string, args string, optional bool) string {
 	if binary == "ip6tables" {
 		if optional {
@@ -2551,6 +2603,10 @@ func iptablesAgentDeleteDnatRulesForPort(binary string, port string, protocol st
 }
 
 func managedPortCleanupCmds(port string) []string {
+	return managedPortCleanupCmdsWithNginx(port, true)
+}
+
+func managedPortCleanupCmdsWithNginx(port string, cleanupNginx bool) []string {
 	inMarker := "fwx-stat-" + port + ":in"
 	outMarker := "fwx-stat-" + port + ":out"
 	cmds := append(managedListenerCleanupCmds(port),
@@ -2559,8 +2615,10 @@ func managedPortCleanupCmds(port string) []string {
 		managedServiceCleanupShell("forwardx-socat-udp-"+port),
 		managedServiceCleanupShell("forwardx-realm-"+port),
 		"rm -f /etc/forwardx/realm/forwardx-realm-"+port+".toml /etc/forwardx/realm/forwardx-realm-"+port+".toml.sha256 2>/dev/null || true",
-		managedNginxCleanupShell(port),
 	)
+	if cleanupNginx {
+		cmds = append(cmds, managedNginxCleanupShell(port))
+	}
 	cmds = append(cmds, nftPortCleanupCmd(port, "both"))
 	for _, binary := range iptablesAgentBinaries() {
 		cmds = append(cmds, iptablesAgentDeleteDnatRulesForPort(binary, port, "both"))
@@ -2602,7 +2660,7 @@ func managedPortCleanupCmds(port string) []string {
 		)
 	}
 	cmds = append(cmds, "rm -f /var/lib/forwardx-agent/traffic_"+port+".prev /var/lib/forwardx-agent/port_"+port+".rule /var/lib/forwardx-agent/port_"+port+".fwtype /var/lib/forwardx-agent/target_"+port+".info 2>/dev/null || true")
-	if targetIP, targetPort, _, ok := readTargetInfo(port); ok {
+	if targetIP, targetPort, _, ok := readTargetInfo(port); ok && iptablesAgentIsIPAddress(targetIP) {
 		target := iptablesAgentAddress(targetIP)
 		tp := strconv.Itoa(targetPort)
 		binary := iptablesAgentBinaryForTarget(target)
@@ -2646,7 +2704,7 @@ func managedListenerCleanupCmds(port string) []string {
 }
 
 func managedNginxCleanupShell(port string) string {
-	return "if [ -f /etc/forwardx/nginx/nginx.conf ] && grep -Eq \"listen .*:" + port + "( |;)|listen \\\\[::\\\\]:" + port + "( |;)|listen 0.0.0.0:" + port + "( |;)\" /etc/forwardx/nginx/nginx.conf 2>/dev/null; then " + managedServiceCleanupShell("forwardx-nginx") + "; fi"
+	return "if [ -f /etc/forwardx/nginx/nginx.conf ] && grep -Eq \"listen .*:" + port + "( |;)|listen \\\\[::\\\\]:" + port + "( |;)|listen 0.0.0.0:" + port + "( |;)\" /etc/forwardx/nginx/nginx.conf 2>/dev/null; then listen_count=$(grep -E '^[[:space:]]*listen[[:space:]]+' /etc/forwardx/nginx/nginx.conf 2>/dev/null | wc -l | tr -d ' '); if [ \"${listen_count:-0}\" -le 1 ]; then " + managedServiceCleanupShell("forwardx-nginx") + "; else echo \"[nginx] keep shared forwardx-nginx while replacing port " + port + "\"; fi; fi"
 }
 
 func fxpPortCleanupCmds(port string) []string {
@@ -2713,7 +2771,7 @@ func ensureCountingChains(port int, targetIP string, targetPort int, protocol st
 				commands = append(commands, iptablesAgentEnsure(binary, "mangle", rule))
 			}
 		}
-		if targetIP != "" && targetPort > 0 {
+		if targetIP != "" && targetPort > 0 && iptablesAgentIsIPAddress(targetIP) {
 			target := iptablesAgentAddress(targetIP)
 			tp := strconv.Itoa(targetPort)
 			binary := iptablesAgentBinaryForTarget(target)
@@ -3244,9 +3302,11 @@ func normalizeRuntimeProtocol(protocol string) string {
 }
 
 type protocolGuardServer struct {
-	rule guardRule
-	ln   net.Listener
-	done chan struct{}
+	rule     guardRule
+	tcpLn    net.Listener
+	udpConn  net.PacketConn
+	done     chan struct{}
+	doneOnce sync.Once
 }
 
 type lookingGlassTask struct {
@@ -3854,6 +3914,9 @@ func guardSignature(rule guardRule) string {
 		strconv.Itoa(rule.ListenPort),
 		rule.TargetIP,
 		strconv.Itoa(rule.TargetPort),
+		strconv.Itoa(rule.BackendPort),
+		strings.TrimSpace(rule.BackendForwardType),
+		normalizeRuntimeProtocol(rule.Protocol),
 		strconv.FormatBool(rule.Policy.BlockHTTP),
 		strconv.FormatBool(rule.Policy.BlockSocks),
 		strconv.FormatBool(rule.Policy.BlockTLS),
@@ -3861,6 +3924,14 @@ func guardSignature(rule guardRule) string {
 		strconv.FormatBool(rule.ProxyProtocolSend),
 		strconv.Itoa(normalizeProxyProtocolVersion(rule.ProxyProtocolVersion)),
 	}, "|")
+}
+
+func guardTCPEnabled(rule guardRule) bool {
+	return normalizeRuntimeProtocol(rule.Protocol) != "udp"
+}
+
+func guardUDPEnabled(rule guardRule) bool {
+	return normalizeRuntimeProtocol(rule.Protocol) != "tcp"
 }
 
 func syncProtocolGuards(cfg Config, rules []guardRule) {
@@ -3896,17 +3967,78 @@ func syncProtocolGuards(cfg Config, rules []guardRule) {
 }
 
 func startProtocolGuard(cfg Config, rule guardRule) {
-	ln, err := net.Listen("tcp", ":"+strconv.Itoa(rule.ListenPort))
-	if err != nil {
-		logf("protocol guard listen failed rule=%d port=%d: %v", rule.RuleID, rule.ListenPort, err)
+	prepareProtocolGuardPort(rule)
+	server := &protocolGuardServer{rule: rule, done: make(chan struct{})}
+	if guardTCPEnabled(rule) {
+		ln, err := net.Listen("tcp", ":"+strconv.Itoa(rule.ListenPort))
+		if err != nil {
+			logf("protocol guard tcp listen failed rule=%d port=%d: %v", rule.RuleID, rule.ListenPort, err)
+			return
+		}
+		server.tcpLn = ln
+	}
+	if guardUDPEnabled(rule) {
+		conn, err := net.ListenPacket("udp", ":"+strconv.Itoa(rule.ListenPort))
+		if err != nil {
+			if server.tcpLn != nil {
+				_ = server.tcpLn.Close()
+			}
+			logf("protocol guard udp listen failed rule=%d port=%d: %v", rule.RuleID, rule.ListenPort, err)
+			return
+		}
+		server.udpConn = conn
+	}
+	if server.tcpLn == nil && server.udpConn == nil {
+		logf("protocol guard no protocol enabled rule=%d port=%d protocol=%s", rule.RuleID, rule.ListenPort, rule.Protocol)
 		return
 	}
-	server := &protocolGuardServer{rule: rule, ln: ln, done: make(chan struct{})}
 	protocolGuardMu.Lock()
 	protocolGuards[guardID(rule)] = server
 	protocolGuardMu.Unlock()
-	go server.serve(cfg)
-	logf("protocol guard started rule=%d tunnel=%d listen=:%d target=%s:%d proxyReceive=%v proxySend=%v proxyVersion=%d", rule.RuleID, rule.TunnelID, rule.ListenPort, rule.TargetIP, rule.TargetPort, rule.ProxyProtocolReceive, rule.ProxyProtocolSend, normalizeProxyProtocolVersion(rule.ProxyProtocolVersion))
+	if server.tcpLn != nil {
+		go server.serveTCP(cfg)
+	}
+	if server.udpConn != nil {
+		go server.serveUDP()
+	}
+	logf("protocol guard started rule=%d tunnel=%d listen=:%d protocol=%s target=%s:%d proxyReceive=%v proxySend=%v proxyVersion=%d", rule.RuleID, rule.TunnelID, rule.ListenPort, normalizeRuntimeProtocol(rule.Protocol), rule.TargetIP, rule.TargetPort, rule.ProxyProtocolReceive, rule.ProxyProtocolSend, normalizeProxyProtocolVersion(rule.ProxyProtocolVersion))
+}
+
+func prepareProtocolGuardPort(rule guardRule) {
+	if rule.ListenPort <= 0 {
+		return
+	}
+	port := strconv.Itoa(rule.ListenPort)
+	stopFXPByListenPort(rule.ListenPort)
+	backendPort := rule.BackendPort
+	if backendPort <= 0 {
+		backendPort = rule.TargetPort
+	}
+	if backendPort != rule.ListenPort {
+		cleanupGostRuntimeIfPortBusy(rule.ListenPort)
+	}
+	for _, cmd := range managedListenerCleanupCmds(port) {
+		_ = runShell(cmd)
+	}
+	backendType := strings.TrimSpace(rule.BackendForwardType)
+	if backendType == "" || backendPort == rule.ListenPort {
+		for _, name := range []string{
+			"forwardx-socat-" + port,
+			"forwardx-socat-tcp-" + port,
+			"forwardx-socat-udp-" + port,
+			"forwardx-realm-" + port,
+		} {
+			_ = runShell(managedServiceCleanupShell(name))
+		}
+		_ = runShell("rm -f /etc/forwardx/realm/forwardx-realm-" + port + ".toml /etc/forwardx/realm/forwardx-realm-" + port + ".toml.sha256 2>/dev/null || true")
+	}
+	if backendType != "nginx" || backendPort == rule.ListenPort {
+		_ = runShell(managedNginxCleanupShell(port))
+	}
+	_ = runShell(nftPortCleanupCmd(port, "both"))
+	for _, binary := range iptablesAgentBinaries() {
+		_ = runShell(iptablesAgentDeleteDnatRulesForPort(binary, port, "both"))
+	}
 }
 
 func stopProtocolGuard(id string) {
@@ -3919,14 +4051,25 @@ func stopProtocolGuard(id string) {
 	if server == nil {
 		return
 	}
-	close(server.done)
-	_ = server.ln.Close()
+	server.close()
 	logf("protocol guard stopped rule=%d port=%d", server.rule.RuleID, server.rule.ListenPort)
 }
 
-func (s *protocolGuardServer) serve(cfg Config) {
+func (s *protocolGuardServer) close() {
+	s.doneOnce.Do(func() {
+		close(s.done)
+		if s.tcpLn != nil {
+			_ = s.tcpLn.Close()
+		}
+		if s.udpConn != nil {
+			_ = s.udpConn.Close()
+		}
+	})
+}
+
+func (s *protocolGuardServer) serveTCP(cfg Config) {
 	for {
-		conn, err := s.ln.Accept()
+		conn, err := s.tcpLn.Accept()
 		if err != nil {
 			select {
 			case <-s.done:
@@ -3942,16 +4085,19 @@ func (s *protocolGuardServer) serve(cfg Config) {
 
 func (s *protocolGuardServer) handleConn(cfg Config, client net.Conn) {
 	defer client.Close()
-	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
-	buf := make([]byte, 4096)
-	n, err := client.Read(buf)
-	_ = client.SetReadDeadline(time.Time{})
-	if err != nil {
-		return
-	}
-	first := buf[:n]
 	proxyInfo := proxyProtocolInfoFromConn(client)
+	first := []byte(nil)
 	if s.rule.ProxyProtocolReceive {
+		_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+		buf := make([]byte, 4096)
+		n, err := client.Read(buf)
+		_ = client.SetReadDeadline(time.Time{})
+		if err != nil {
+			return
+		}
+		if n > 0 {
+			first = append(first, buf[:n]...)
+		}
 		parsed, remaining, ok, err := consumeProxyProtocolFromConn(client, first, 5*time.Second)
 		if err != nil {
 			logf("protocol guard proxy receive failed rule=%d: %v", s.rule.RuleID, err)
@@ -3961,17 +4107,6 @@ func (s *protocolGuardServer) handleConn(cfg Config, client net.Conn) {
 			proxyInfo = parsed
 			first = remaining
 		}
-	}
-	if s.rule.Policy.enabled() {
-		sample, proto, blocked := detectBlockedProtocolWithConfirmations(client, first, s.rule.Policy)
-		first = sample
-		if blocked && proto != "" {
-			reportProtocolBlock(cfg, s.rule, proto)
-			return
-		}
-	} else if proto := detectBlockedProtocol(first, s.rule.Policy); proto != "" {
-		reportProtocolBlock(cfg, s.rule, proto)
-		return
 	}
 	target, err := net.DialTimeout("tcp", net.JoinHostPort(s.rule.TargetIP, strconv.Itoa(s.rule.TargetPort)), 10*time.Second)
 	if err != nil {
@@ -3987,15 +4122,184 @@ func (s *protocolGuardServer) handleConn(cfg Config, client net.Conn) {
 			}
 		}
 	}
-	if len(first) > 0 {
-		if _, err := target.Write(first); err != nil {
-			return
-		}
-	}
 	errCh := make(chan error, 2)
-	go func() { _, err := io.Copy(target, client); errCh <- err }()
+	go func() { errCh <- s.copyTCPToTargetWithGuard(cfg, client, target, first) }()
 	go func() { _, err := io.Copy(client, target); errCh <- err }()
 	<-errCh
+}
+
+func (s *protocolGuardServer) copyTCPToTargetWithGuard(cfg Config, client net.Conn, target net.Conn, initial []byte) error {
+	sample := make([]byte, 0, protocolGuardSampleMaxBytes)
+	firstData := true
+	inspect := func(chunk []byte) (string, bool) {
+		if !s.rule.Policy.enabled() || len(chunk) == 0 || len(sample) >= protocolGuardSampleMaxBytes {
+			return "", false
+		}
+		remaining := protocolGuardSampleMaxBytes - len(sample)
+		if remaining > len(chunk) {
+			remaining = len(chunk)
+		}
+		sample = append(sample, chunk[:remaining]...)
+		proto := detectBlockedProtocol(sample, s.rule.Policy)
+		return proto, proto != ""
+	}
+	writeChunk := func(chunk []byte) error {
+		if len(chunk) == 0 {
+			return nil
+		}
+		if firstData {
+			firstData = false
+			if _, err := target.Write(chunk); err != nil {
+				return err
+			}
+			if proto, blocked := inspect(chunk); blocked {
+				go reportProtocolBlock(cfg, s.rule, proto)
+				return fmt.Errorf("protocol blocked: %s", proto)
+			}
+			return nil
+		}
+		if proto, blocked := inspect(chunk); blocked {
+			go reportProtocolBlock(cfg, s.rule, proto)
+			return fmt.Errorf("protocol blocked: %s", proto)
+		}
+		_, err := target.Write(chunk)
+		return err
+	}
+	if err := writeChunk(initial); err != nil {
+		return err
+	}
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := client.Read(buf)
+		if n > 0 {
+			if writeErr := writeChunk(buf[:n]); writeErr != nil {
+				return writeErr
+			}
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+type protocolGuardUDPSession struct {
+	target net.Conn
+	last   time.Time
+}
+
+func (s *protocolGuardServer) serveUDP() {
+	sessions := map[string]*protocolGuardUDPSession{}
+	var sessionMu sync.Mutex
+	closeSessions := func() {
+		sessionMu.Lock()
+		defer sessionMu.Unlock()
+		for key, session := range sessions {
+			_ = session.target.Close()
+			delete(sessions, key)
+		}
+	}
+	cleanupTicker := time.NewTicker(30 * time.Second)
+	stopCleanup := make(chan struct{})
+	defer func() {
+		close(stopCleanup)
+		cleanupTicker.Stop()
+		closeSessions()
+	}()
+	go func() {
+		for {
+			select {
+			case <-s.done:
+				closeSessions()
+				return
+			case <-stopCleanup:
+				return
+			case <-cleanupTicker.C:
+				now := time.Now()
+				sessionMu.Lock()
+				for key, session := range sessions {
+					if now.Sub(session.last) <= protocolGuardUDPIdleTimeout {
+						continue
+					}
+					_ = session.target.Close()
+					delete(sessions, key)
+				}
+				sessionMu.Unlock()
+			}
+		}
+	}()
+
+	buf := make([]byte, 65535)
+	for {
+		n, clientAddr, err := s.udpConn.ReadFrom(buf)
+		if err != nil {
+			select {
+			case <-s.done:
+				return
+			default:
+				logf("protocol guard udp read rule=%d: %v", s.rule.RuleID, err)
+				return
+			}
+		}
+		if n <= 0 || clientAddr == nil {
+			continue
+		}
+		packet := append([]byte(nil), buf[:n]...)
+		key := clientAddr.String()
+		sessionMu.Lock()
+		session := sessions[key]
+		if session == nil {
+			target, err := net.DialTimeout("udp", net.JoinHostPort(s.rule.TargetIP, strconv.Itoa(s.rule.TargetPort)), 10*time.Second)
+			if err != nil {
+				sessionMu.Unlock()
+				if shouldLogAgentReport(fmt.Sprintf("protocol-guard-udp-dial:%d", s.rule.RuleID), agentReportLogInterval) {
+					logf("protocol guard udp dial target rule=%d: %v", s.rule.RuleID, err)
+				}
+				continue
+			}
+			session = &protocolGuardUDPSession{target: target, last: time.Now()}
+			sessions[key] = session
+			go s.copyUDPToClient(key, clientAddr, target, sessions, &sessionMu)
+		}
+		session.last = time.Now()
+		target := session.target
+		sessionMu.Unlock()
+		if _, err := target.Write(packet); err != nil {
+			sessionMu.Lock()
+			if sessions[key] == session {
+				delete(sessions, key)
+			}
+			sessionMu.Unlock()
+			_ = target.Close()
+			if shouldLogAgentReport(fmt.Sprintf("protocol-guard-udp-write:%d", s.rule.RuleID), agentReportLogInterval) {
+				logf("protocol guard udp write target rule=%d client=%s: %v", s.rule.RuleID, key, err)
+			}
+		}
+	}
+}
+
+func (s *protocolGuardServer) copyUDPToClient(key string, clientAddr net.Addr, target net.Conn, sessions map[string]*protocolGuardUDPSession, sessionMu *sync.Mutex) {
+	buf := make([]byte, 65535)
+	for {
+		_ = target.SetReadDeadline(time.Now().Add(protocolGuardUDPIdleTimeout))
+		n, err := target.Read(buf)
+		if err != nil {
+			break
+		}
+		if n > 0 {
+			_, _ = s.udpConn.WriteTo(buf[:n], clientAddr)
+		}
+		sessionMu.Lock()
+		if session := sessions[key]; session != nil && session.target == target {
+			session.last = time.Now()
+		}
+		sessionMu.Unlock()
+	}
+	sessionMu.Lock()
+	if session := sessions[key]; session != nil && session.target == target {
+		delete(sessions, key)
+	}
+	sessionMu.Unlock()
+	_ = target.Close()
 }
 
 type proxyProtocolInfo struct {
@@ -5080,6 +5384,7 @@ func shouldLogAgentReport(key string, interval time.Duration) bool {
 	now := time.Now()
 	agentReportLogMu.Lock()
 	defer agentReportLogMu.Unlock()
+	pruneTimeMapLocked(agentReportLogAt, now, agentMemoryCacheRetention, agentReportLogMaxKeys)
 	last := agentReportLogAt[key]
 	if !last.IsZero() && now.Sub(last) < interval {
 		return false
@@ -5119,6 +5424,17 @@ func logf(format string, args ...any) {
 	pruneAgentLocalLogsLocked()
 }
 
+func pruneAgentRuntimeData() {
+	pruneAgentLocalLogs()
+	pruneAgentMemoryCaches()
+}
+
+func pruneAgentLocalLogs() {
+	agentLogMu.Lock()
+	defer agentLogMu.Unlock()
+	pruneAgentLocalLogsLocked()
+}
+
 func pruneAgentLocalLogsLocked() {
 	if time.Since(agentLogPrunedAt) < time.Hour {
 		return
@@ -5134,6 +5450,13 @@ func pruneAgentLocalLogsLocked() {
 }
 
 func pruneAgentLocalLogFile(path string) {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return
+	}
+	if info.Size() > agentLogMaxBytes {
+		trimLogFileTail(path, agentLogTailBytes)
+	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return
@@ -5158,14 +5481,115 @@ func pruneAgentLocalLogFile(path string) {
 		}
 		changed = true
 	}
-	if !changed {
+	if changed {
+		if len(retained) == 0 {
+			_ = os.WriteFile(path, nil, 0644)
+		} else {
+			_ = os.WriteFile(path, []byte(strings.Join(retained, "\n")+"\n"), 0644)
+		}
+	}
+	if info, err := os.Stat(path); err == nil && !info.IsDir() && info.Size() > agentLogMaxBytes {
+		trimLogFileTail(path, agentLogTailBytes)
+	}
+}
+
+func trimLogFileTail(path string, keepBytes int64) {
+	if keepBytes <= 0 || keepBytes > int64(int(keepBytes)) {
 		return
 	}
-	if len(retained) == 0 {
-		_ = os.WriteFile(path, nil, 0644)
+	f, err := os.Open(path)
+	if err != nil {
 		return
 	}
-	_ = os.WriteFile(path, []byte(strings.Join(retained, "\n")+"\n"), 0644)
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || info.IsDir() || info.Size() <= keepBytes {
+		return
+	}
+	buf := make([]byte, int(keepBytes))
+	n, err := f.ReadAt(buf, info.Size()-keepBytes)
+	if err != nil && err != io.EOF {
+		return
+	}
+	data := buf[:n]
+	if idx := bytes.IndexByte(data, '\n'); idx >= 0 && idx+1 < len(data) {
+		data = data[idx+1:]
+	}
+	_ = os.WriteFile(path, data, 0644)
+}
+
+func pruneAgentMemoryCaches() {
+	now := time.Now()
+	if !agentMemoryPrunedAt.IsZero() && now.Sub(agentMemoryPrunedAt) < time.Hour {
+		return
+	}
+	agentMemoryPrunedAt = now
+	agentReportLogMu.Lock()
+	pruneTimeMapLocked(agentReportLogAt, now, agentMemoryCacheRetention, agentReportLogMaxKeys)
+	agentReportLogMu.Unlock()
+	actionEpochMu.Lock()
+	pruneIssuedAtMapLocked(latestActionIssuedAt, now, agentMemoryCacheRetention)
+	actionEpochMu.Unlock()
+	countingChainMu.Lock()
+	pruneTimeMapLocked(countingChainCheckedAt, now, agentMemoryCacheRetention, 0)
+	for key := range countingChainSignatures {
+		if _, ok := countingChainCheckedAt[key]; !ok {
+			delete(countingChainSignatures, key)
+		}
+	}
+	countingChainMu.Unlock()
+	runtimeActionMu.Lock()
+	for key, state := range runtimeActionCache {
+		if state.CheckedAt.IsZero() || now.Sub(state.CheckedAt) > agentMemoryCacheRetention {
+			delete(runtimeActionCache, key)
+		}
+	}
+	runtimeActionMu.Unlock()
+}
+
+func pruneTimeMapLocked(values map[string]time.Time, now time.Time, maxAge time.Duration, maxKeys int) {
+	if len(values) == 0 {
+		return
+	}
+	for key, seenAt := range values {
+		if seenAt.IsZero() || now.Sub(seenAt) > maxAge {
+			delete(values, key)
+		}
+	}
+	if maxKeys <= 0 || len(values) <= maxKeys {
+		return
+	}
+	type entry struct {
+		key string
+		at  time.Time
+	}
+	entries := make([]entry, 0, len(values))
+	for key, seenAt := range values {
+		entries = append(entries, entry{key: key, at: seenAt})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].at.Before(entries[j].at) })
+	for i := 0; i < len(entries)-maxKeys; i++ {
+		delete(values, entries[i].key)
+	}
+}
+
+func pruneIssuedAtMapLocked(values map[string]int64, now time.Time, maxAge time.Duration) {
+	for key, issuedAt := range values {
+		at := unixMillisOrSecondsTime(issuedAt)
+		if at.IsZero() || now.Sub(at) > maxAge {
+			delete(values, key)
+		}
+	}
+}
+
+func unixMillisOrSecondsTime(value int64) time.Time {
+	if value <= 0 {
+		return time.Time{}
+	}
+	if value > 1_000_000_000_000 {
+		return time.UnixMilli(value)
+	}
+	return time.Unix(value, 0)
 }
 
 func fatal(format string, args ...any) {

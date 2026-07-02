@@ -2,6 +2,7 @@ import { protectedProcedure, adminProcedure, router } from "../_core/trpc";
 import { z } from "zod";
 import { nanoid } from "nanoid";
 import * as db from "../db";
+import { appendPanelLog } from "../_core/panelLogger";
 import { markHostMetricsWatching, pushAgentRefresh, pushAgentUpgrade } from "../agentEvents";
 import { AGENT_ASSET_NAMES, getMissingBundledAgentAssets } from "../agentAssets";
 import { pushTunnelEndpointRefresh, requireHostAccess } from "./helpers";
@@ -27,9 +28,11 @@ const hostProtocolPolicyFields = ["blockHttp", "blockSocks", "blockTls"] as cons
 async function refreshHostPolicyRuntime(hostId: number, reason: string) {
   const id = Number(hostId);
   if (!Number.isFinite(id) || id <= 0) return;
+  const host = await db.getHostById(id).catch(() => null);
   await db.resetAgentRuntimeStateForHost(id);
   clearTunnelRuntimeStatusForHost(id);
   const tunnels = await db.getTunnelsByHost(id);
+  appendPanelLog("info", `[Host] refresh runtime host=${id} name=${String(host?.name || `主机 #${id}`)} reason=${reason} tunnelCount=${tunnels.length}`);
   for (const tunnel of tunnels as any[]) {
     await pushTunnelEndpointRefresh(tunnel, reason);
   }
@@ -372,7 +375,7 @@ export const hostsRouter = router({
       }));
     }),
     probeServiceSeries: protectedProcedure
-      .input(z.object({ serviceIds: z.array(z.number().int().positive()).max(200).optional(), hostId: z.number().int().positive().optional(), hours: z.number().int().min(1).max(24 * 30).default(24) }).optional())
+      .input(z.object({ serviceIds: z.array(z.number().int().positive()).max(200).optional(), hostId: z.number().int().positive().optional(), hours: z.number().int().min(1).max(24 * 3).default(24) }).optional())
       .query(async ({ input, ctx }) => {
         const isAdmin = ctx.user.role === "admin";
         const visibleServices = await db.getHostProbeServices(isAdmin ? undefined : ctx.user.id);
@@ -693,6 +696,16 @@ export const hostsRouter = router({
           () => db.getLatestHostMetrics(input.hostId, input.limit),
         );
       }),
+    latestMetricsSummary: protectedProcedure
+      .input(z.object({ hostIds: z.array(z.number()).max(500).optional() }).optional())
+      .query(async ({ input, ctx }) => {
+        const hostIds = Array.from(new Set((input?.hostIds || [])
+          .map((id) => Number(id))
+          .filter((id) => Number.isInteger(id) && id > 0)));
+        if (hostIds.length === 0) return [];
+        for (const hostId of hostIds) await requireHostAccess(ctx, hostId);
+        return db.getLatestHostMetricRows(hostIds);
+      }),
     traffic: protectedProcedure
       .input(z.object({ hostId: z.number() }))
       .query(async ({ input, ctx }) => {
@@ -717,6 +730,7 @@ export const hostsRouter = router({
       .mutation(async ({ input }) => {
         const host = await db.getHostById(input.hostId);
         if (!host) throw new Error("主机不存在");
+        appendPanelLog("info", `[HostTraffic] reset host=${host.id} name=${host.name} reason=manual-admin-reset`);
         return db.resetHostTraffic(input.hostId);
       }),
     watchMetrics: protectedProcedure
@@ -741,6 +755,7 @@ export const hostsRouter = router({
         if (currentVersion && isAgentVersionAtLeast(currentVersion, targetVersion)) {
           return { success: true, pushed: false, alreadyLatest: true };
         }
+        appendPanelLog("info", `[AgentUpgrade] request host=${host.id} name=${host.name} current=${currentVersion || "-"} target=${targetVersion}`);
         await assertAgentReleaseAssetsReady(targetVersion);
         await db.requestHostAgentUpgrade(input.hostId, targetVersion);
         const configuredPanelUrl = (await db.getSetting("panelPublicUrl")) || "";
@@ -771,6 +786,7 @@ export const hostsRouter = router({
             skippedLatest += 1;
             continue;
           }
+          appendPanelLog("info", `[AgentUpgrade] request host=${host.id} name=${host.name} current=${currentVersion || "-"} target=${targetVersion} batch=true`);
           await db.requestHostAgentUpgrade(hostId, targetVersion);
           requested += 1;
           if (pushAgentUpgrade(hostId, targetVersion, panelUrl)) pushed += 1;

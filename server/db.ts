@@ -16,10 +16,12 @@ import { maintainCurrentPostgresqlDatabase } from "./postgresqlMaintenance";
 import { maintainCurrentMysqlDatabase } from "./mysqlMaintenance";
 import { randomAvataaarsValue } from "../shared/avatar";
 import { migrateLegacyUserAvatars } from "./repositories/userRepository";
-import { ensureTrafficStatBucketsBackfilled } from "./repositories/metricsRepository";
+import { cleanOldTrafficStatBuckets, cleanOldTrafficStats, ensureTrafficStatBucketsBackfilled } from "./repositories/metricsRepository";
 import { getSetting, setSetting } from "./repositories/settingsRepository";
 import { backfillManualEntitlementsFromEffectiveUsers } from "./repositories/billingRepository";
+import { backfillTrafficBillingRuleUsageFromStats } from "./repositories/trafficBillingRepository";
 import { markLocalSetupComplete } from "./setupState";
+import { seedDevPanelData } from "./devPanel";
 
 export { getDb } from "./dbRuntime";
 export * from "./repositories/userRepository";
@@ -111,11 +113,23 @@ export async function initDatabase() {
     await backfillRateLimitsToMbps().catch((error) => {
       console.warn("[Database] Rate limit unit backfill skipped:", error instanceof Error ? error.message : String(error));
     });
+    await backfillTrafficBillingRuleUsageFromStats().catch((error) => {
+      console.warn("[TrafficBilling] Rule usage backfill skipped:", error instanceof Error ? error.message : String(error));
+    });
+    await cleanOldTrafficStats(72).catch((error) => {
+      console.warn("[TrafficSummary] Startup traffic stats cleanup skipped:", error instanceof Error ? error.message : String(error));
+    });
+    await cleanOldTrafficStatBuckets(72).catch((error) => {
+      console.warn("[TrafficSummary] Startup traffic bucket cleanup skipped:", error instanceof Error ? error.message : String(error));
+    });
     await ensureTrafficStatBucketsBackfilled().catch((error) => {
       console.warn("[TrafficSummary] Startup bucket backfill skipped:", error instanceof Error ? error.message : String(error));
     });
     await backfillManualEntitlementsFromEffectiveUsers().catch((error) => {
       console.warn("[Database] Manual entitlement backfill skipped:", error instanceof Error ? error.message : String(error));
+    });
+    await seedDevPanelData().catch((error) => {
+      console.warn("[DevPanel] Seed data skipped:", error instanceof Error ? error.message : String(error));
     });
     await maintainCurrentPostgresqlDatabase().catch((error) => {
       console.warn("[PostgreSQL] Startup health check skipped:", error instanceof Error ? error.message : String(error));
